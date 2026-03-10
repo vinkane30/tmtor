@@ -1,0 +1,22 @@
+# IDX Story Bot — Python Dependencies
+# Install: pip install -r requirements.txt
+
+# Telegram
+python-telegram-bot==20.7
+
+# HTTP & Scraping
+httpx==0.27.0
+beautifulsoup4==4.12.3
+lxml==5.1.0
+feedparser==6.0.11
+
+# Data & Indicators
+yfinance==0.2.37
+pandas==2.2.1
+numpy==1.26.4
+
+# Scheduling
+APScheduler==3.10.4
+
+# Utilities
+python-dotenv==1.0.1
