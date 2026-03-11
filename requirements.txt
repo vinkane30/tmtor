@@ -5,18 +5,18 @@
 python-telegram-bot==20.7
 
 # HTTP & Scraping
-httpx==0.27.0
-beautifulsoup4==4.12.3
-lxml==5.1.0
-feedparser==6.0.11
+httpx
+beautifulsoup4
+lxml
+feedparser
 
 # Data & Indicators
-yfinance==0.2.37
+yfinance
 pandas
 numpy
 
 # Scheduling
-APScheduler==3.10.4
+APScheduler
 
 # Utilities
-python-dotenv==1.0.1
+python-dotenv
