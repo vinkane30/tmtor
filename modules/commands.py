@@ -378,7 +378,7 @@ async def cmd_ticker(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"EMA8/21: {_rp(tech.ema8)} / {_rp(tech.ema21)}",
         f"EMA50/200: {_rp(tech.ema50)} / {_rp(tech.ema200)}",
         f"BB: {_rp(tech.bb_upper)} / {_rp(tech.bb_mid)} / {_rp(tech.bb_lower)}",
-        f"RS vs IHSG: {tech.rs_score:.2f} ({'outperforming' if tech.rs_score > 1.2 else 'underperforming'})",
+        "RS vs IHSG: " + str(round(tech.rs_score, 2)) + (" (outperforming)" if tech.rs_score > 1.2 else " (underperforming)"),
         f"Volume: {tech.today_volume/1e6:.1f}M ({tech.volume_ratio:.1f}x) {_safe(tech.volume_signal)}",
         f"S1/S2: {_rp(tech.support_1)} / {_rp(tech.support_2)}",
         f"R1/R2: {_rp(tech.resistance_1)} / {_rp(tech.resistance_2)}",
