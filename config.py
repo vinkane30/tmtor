@@ -90,7 +90,7 @@ REFERENCE_MULTIBAGGERS = ["PANI", "BBHI", "BREN", "RLCO"]
 # ─────────────────────────────────────────────
 # SELF-IMPROVEMENT
 # ─────────────────────────────────────────────
-WEEKLY_REPORT_DAY  = "sunday"
+WEEKLY_REPORT_DAY  = "sun"
 WEEKLY_REPORT_TIME = "19:00"
 LOOKBACK_DAYS_EVAL = 7    # how many days back to evaluate signals
 
