@@ -96,14 +96,17 @@ def main():
 
     init_db()
 
-    app = Application.builder().token(config.TELEGRAM_TOKEN).post_init(post_init).build()
-    app.add_handler(CommandHandler("scan",   cmd_scan))
-    app.add_handler(CommandHandler("ticker", cmd_ticker))
-    app.add_handler(CommandHandler("news",   cmd_news))
-    app.add_handler(CommandHandler("report", cmd_report))
+    async def run():
+        app = Application.builder().token(config.TELEGRAM_TOKEN).post_init(post_init).build()
+        app.add_handler(CommandHandler("scan",   cmd_scan))
+        app.add_handler(CommandHandler("ticker", cmd_ticker))
+        app.add_handler(CommandHandler("news",   cmd_news))
+        app.add_handler(CommandHandler("report", cmd_report))
 
-    logger.info("IDX Story Bot running. Scans: %s WIB", config.SCAN_TIMES_WIB)
-    app.run_polling(drop_pending_updates=True)
+        logger.info("IDX Story Bot running. Scans: %s WIB", config.SCAN_TIMES_WIB)
+        await app.run_polling(drop_pending_updates=True)
+
+    asyncio.run(run())
 
 
 if __name__ == "__main__":
