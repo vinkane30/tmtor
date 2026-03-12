@@ -85,20 +85,23 @@ def _build_scheduler(bot: Bot) -> AsyncIOScheduler:
 
 # ── Entry point ────────────────────────────────────────────────────────────
 
+async def post_init(application):
+    scheduler = _build_scheduler(application.bot)
+    scheduler.start()
+
+
 def main():
     if config.TELEGRAM_TOKEN == "YOUR_BOT_TOKEN_HERE":
         logger.error("Set TELEGRAM_TOKEN env var before starting."); sys.exit(1)
 
     init_db()
 
-    app = Application.builder().token(config.TELEGRAM_TOKEN).build()
+    app = Application.builder().token(config.TELEGRAM_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("scan",   cmd_scan))
     app.add_handler(CommandHandler("ticker", cmd_ticker))
     app.add_handler(CommandHandler("news",   cmd_news))
     app.add_handler(CommandHandler("report", cmd_report))
 
-    scheduler = _build_scheduler(app.bot)
-    scheduler.start()
     logger.info("IDX Story Bot running. Scans: %s WIB", config.SCAN_TIMES_WIB)
     app.run_polling(drop_pending_updates=True)
 
