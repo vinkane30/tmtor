@@ -1,6 +1,7 @@
 """
-modules/technical.py — IDX High-Momentum Quality Analyzer
-Full trade setup: entry, exit, thesis, risk, fundamentals, macro, news
+modules/technical.py — IDX Quantitative Analysis Engine v2
+Multi-regime scoring, RS, A/D divergence, institutional footprint,
+rumor detection, ARA/ARB guard, 0-100 scoring system.
 """
 
 import logging
@@ -18,8 +19,39 @@ import feedparser
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 import config
+from modules.regime import (detect_regime, calc_rs_score, detect_ad_divergence,
+                             RegimeResult, calc_ad_line)
 
 logger = logging.getLogger(__name__)
+
+# ─────────────────────────────────────────────
+# CONSTANTS
+# ─────────────────────────────────────────────
+
+LQ45_TICKERS = {
+    "BBCA", "BBRI", "BBNI", "BMRI", "TLKM", "ASII", "UNVR", "PGAS",
+    "ADRO", "PTBA", "INDF", "ICBP", "KLBF", "SIDO", "GGRM", "HMSP",
+    "JSMR", "SMGR", "ANTM", "INCO", "MIKA", "HEAL", "ACES", "MAPI",
+    "CPIN", "JPFA", "EXCL", "ISAT", "TOWR", "BRIS",
+}
+
+CONGLOMERATE_KEYWORDS = [
+    "salim", "sinarmas", "prajogo", "pangestu", "lippo", "bakrie",
+    "hary tanoe", "djarum", "wings", "gudang garam", "rajawali",
+    "medco", "indofood", "astra", "telkom",
+]
+
+RUMOR_KEYWORDS = [
+    "rights issue", "tender offer", "backdoor listing", "akuisisi",
+    "merger", "buyback", "delisting", "go private", "strategic investor",
+    "injeksi aset", "RUPSLB", "divestasi", "spin off",
+]
+
+# ARA/ARB limits by price tier (IDX rules)
+def _ara_arb_limit(price: float) -> float:
+    if price < 200:    return 0.35
+    elif price < 5000: return 0.25
+    else:              return 0.20
 
 # ─────────────────────────────────────────────
 # DATA CLASSES
@@ -30,7 +62,16 @@ class TechnicalResult:
     ticker:            str
     company_name:      str = ""
     current_price:     float = 0.0
-    
+
+    # Regime context
+    regime:            str = ""
+    strategy:          str = ""
+
+    # Score (0–100)
+    total_score:       int = 0
+    score_label:       str = ""      # "High Conviction" | "Moderate" | "Low Interest"
+    play_type:         str = ""      # "Momentum Play" | "Mean Reversion" | "Rumor Play" | "Value Play"
+
     # Technical
     ema8:              float = 0.0
     ema21:             float = 0.0
@@ -38,22 +79,42 @@ class TechnicalResult:
     ema200:            float = 0.0
     rsi:               float = 0.0
     adx:               float = 0.0
-    
-    # Volume
+    atr:               float = 0.0
+    bb_upper:          float = 0.0
+    bb_lower:          float = 0.0
+    bb_mid:            float = 0.0
+
+    # RS & A/D
+    rs_score:          float = 0.0
+    ad_divergence:     bool = False
+    ad_divergence_msg: str = ""
+
+    # Volume / Flow
     today_volume:      float = 0.0
     avg_volume_20d:    float = 0.0
     volume_ratio:      float = 0.0
-    volume_signal:     str = ""       # "accumulation" | "distribution" | "neutral"
-    
-    # Price levels
+    volume_signal:     str = ""
+    daily_turnover:    float = 0.0
+    is_silent_accum:   bool = False   # high vol + narrow range
+
+    # Foreign flow (simulated from yfinance institutional data)
+    foreign_flow_signal: str = ""
+
+    # Levels
     support_1:         float = 0.0
     support_2:         float = 0.0
     resistance_1:      float = 0.0
     resistance_2:      float = 0.0
     high_20d:          float = 0.0
     low_20d:           float = 0.0
-    
-    # Trade setup
+    high_6m:           float = 0.0
+
+    # ARA/ARB
+    at_arb:            bool = False
+    at_ara:            bool = False
+    arb_warning:       str = ""
+
+    # Trade levels
     entry_low:         float = 0.0
     entry_high:        float = 0.0
     stop_loss:         float = 0.0
@@ -61,7 +122,8 @@ class TechnicalResult:
     t2:                float = 0.0
     t3:                float = 0.0
     rr_ratio:          float = 0.0
-    
+    lot_size:          int = 0
+
     # Fundamental
     roe:               Optional[float] = None
     der:               Optional[float] = None
@@ -69,29 +131,27 @@ class TechnicalResult:
     revenue_growth:    Optional[float] = None
     market_cap:        Optional[float] = None
     pe_ratio:          Optional[float] = None
-    
-    # Scoring
-    tech_score:        int = 0
-    fund_score:        int = 0
+    is_lq45:           bool = False
+
+    # Conditions
     conditions_met:    List[str] = field(default_factory=list)
     conditions_failed: List[str] = field(default_factory=list)
     passed:            bool = False
     is_rejected:       bool = False
     rejection_reason:  str = ""
-    
-    # Macro & sentiment
-    ihsg_trend:        str = ""       # "bullish" | "neutral" | "bearish"
-    
-    # News
-    recent_news:       List[str] = field(default_factory=list)
-    
-    # Full thesis
+
+    # Thesis
     buy_thesis:        str = ""
     bear_case:         str = ""
     invalidation:      str = ""
     entry_trigger:     str = ""
-    verdict:           str = ""       # "BUY" | "WATCH" | "AVOID"
+    verdict:           str = ""
     verdict_reason:    str = ""
+
+    # News & rumors
+    recent_news:       List[str] = field(default_factory=list)
+    rumor_flags:       List[str] = field(default_factory=list)
+    conglomerate_flag: str = ""
 
 
 # ─────────────────────────────────────────────
@@ -100,9 +160,6 @@ class TechnicalResult:
 
 def _rp(v: float) -> str:
     return f"Rp {v:,.0f}"
-
-def _pct(v: float) -> str:
-    return f"{v:+.1f}%"
 
 def _calc_rsi(series: pd.Series, period: int = 14) -> float:
     delta = series.diff()
@@ -124,13 +181,29 @@ def _calc_adx(df: pd.DataFrame, period: int = 14) -> float:
         ndm  = down.where((down > up) & (down > 0), 0.0)
         pdi  = 100 * pdm.rolling(period).mean() / atr.replace(0, np.nan)
         ndi  = 100 * ndm.rolling(period).mean() / atr.replace(0, np.nan)
-        dx   = (100 * (pdi - ndi).abs() / (pdi + ndi).replace(0, np.nan))
+        dx   = 100 * (pdi - ndi).abs() / (pdi + ndi).replace(0, np.nan)
         return float(dx.rolling(period).mean().iloc[-1])
     except Exception:
         return 0.0
 
+def _calc_atr(df: pd.DataFrame, period: int = 14) -> float:
+    try:
+        high, low, close = df["High"], df["Low"], df["Close"]
+        tr = pd.concat([high - low,
+                        (high - close.shift()).abs(),
+                        (low  - close.shift()).abs()], axis=1).max(axis=1)
+        return float(tr.rolling(period).mean().iloc[-1])
+    except Exception:
+        return 0.0
+
+def _calc_bollinger(close: pd.Series, period: int = 20) -> Tuple[float, float, float]:
+    mid   = close.rolling(period).mean()
+    std   = close.rolling(period).std()
+    upper = mid + 2 * std
+    lower = mid - 2 * std
+    return float(upper.iloc[-1]), float(mid.iloc[-1]), float(lower.iloc[-1])
+
 def _support_resistance(df: pd.DataFrame) -> Tuple[float, float, float, float]:
-    """Pivot-based S/R using last 20 candles."""
     try:
         highs = df["High"].rolling(5).max()
         lows  = df["Low"].rolling(5).min()
@@ -142,9 +215,12 @@ def _support_resistance(df: pd.DataFrame) -> Tuple[float, float, float, float]:
     except Exception:
         return 0, 0, 0, 0
 
-def _fetch_news(ticker_clean: str) -> List[str]:
-    """Fetch recent news from Kontan and Bisnis RSS."""
-    headlines = []
+def _fetch_news_and_rumors(ticker_clean: str) -> Tuple[List[str], List[str], str]:
+    """Returns (headlines, rumor_flags, conglomerate_flag)"""
+    headlines   = []
+    rumor_flags = []
+    cong_flag   = ""
+
     feeds = [
         f"https://rss.kontan.co.id/search/{ticker_clean}",
         "https://rss.kontan.co.id/category/bursa",
@@ -153,69 +229,228 @@ def _fetch_news(ticker_clean: str) -> List[str]:
     for url in feeds:
         try:
             feed = feedparser.parse(url)
-            for entry in feed.entries[:5]:
+            for entry in feed.entries[:10]:
                 title = entry.get("title", "")
-                if ticker_clean.upper() in title.upper() or len(headlines) < 3:
+                if not title:
+                    continue
+                tl = title.lower()
+
+                if ticker_clean.upper() in title.upper():
                     headlines.append(title)
+
+                    # Rumor detection
+                    for kw in RUMOR_KEYWORDS:
+                        if kw in tl and kw not in rumor_flags:
+                            rumor_flags.append(kw.title())
+
+                    # Conglomerate detection
+                    for kw in CONGLOMERATE_KEYWORDS:
+                        if kw in tl:
+                            cong_flag = f"🏛️ {kw.title()} group involvement detected"
+                            break
+
                 if len(headlines) >= 5:
                     break
         except Exception:
             pass
         if len(headlines) >= 5:
             break
-    return headlines[:5]
 
-def _ihsg_trend() -> str:
-    """Check IHSG vs EMA50 and EMA200."""
+    return headlines[:5], rumor_flags[:5], cong_flag
+
+def _check_arb_ara(price: float, prev_close: float) -> Tuple[bool, bool, str]:
+    """Check if stock is at ARA (ceiling) or ARB (floor)."""
+    limit   = _ara_arb_limit(prev_close)
+    arb_lvl = prev_close * (1 - limit)
+    ara_lvl = prev_close * (1 + limit)
+
+    at_arb  = price <= arb_lvl * 1.005
+    at_ara  = price >= ara_lvl * 0.995
+
+    if at_arb:
+        return True, False, f"⚠️ ARB WARNING: Stock near auto-reject floor {_rp(arb_lvl)} — falling knife risk, avoid entry"
+    if at_ara:
+        return False, True, f"⚠️ ARA: Stock near auto-reject ceiling {_rp(ara_lvl)} — do NOT chase"
+    return False, False, ""
+
+def _detect_silent_accumulation(df: pd.DataFrame, vol_ratio: float) -> bool:
+    """
+    Silent accumulation: volume > 3x avg BUT daily range is narrow (<1.5% of price).
+    Bandar buying without moving price = pre-breakout setup.
+    """
     try:
-        ihsg = yf.Ticker("^JKSE")
-        df   = ihsg.history(period="1y", interval="1d")
-        if df.empty:
-            return "unknown"
-        close  = df["Close"]
-        ema50  = float(close.ewm(span=50).mean().iloc[-1])
-        ema200 = float(close.ewm(span=200).mean().iloc[-1])
-        price  = float(close.iloc[-1])
-        if price > ema50 and price > ema200:
-            return "bullish"
-        elif price > ema200:
-            return "neutral"
-        else:
-            return "bearish"
+        day_range = float(df["High"].iloc[-1] - df["Low"].iloc[-1])
+        price     = float(df["Close"].iloc[-1])
+        range_pct = day_range / price * 100
+        return vol_ratio >= 3.0 and range_pct < 1.5
     except Exception:
-        return "unknown"
+        return False
 
 
 # ─────────────────────────────────────────────
 # UNIVERSE FILTER
 # ─────────────────────────────────────────────
 
-NOTASI_KHUSUS_BLACKLIST = set()  # populate from config or daily IDX file
+NOTASI_KHUSUS_BLACKLIST: set = set()
 
 def _passes_universe_filter(ticker: str, price: float,
-                             avg_vol: float, avg_val: float,
-                             market_cap: float) -> Tuple[bool, str]:
+                             avg_vol: float, daily_turnover: float) -> Tuple[bool, str]:
     if ticker in NOTASI_KHUSUS_BLACKLIST:
         return False, "Notasi Khusus — legal/financial risk"
     if price < 200:
-        return False, f"Price {_rp(price)} below Rp 200 safety floor (gocap risk)"
+        return False, f"Price {_rp(price)} di bawah Rp 200 (gocap risk)"
     if avg_vol < 500_000:
-        return False, f"Avg volume {avg_vol/1e6:.2f}M below 500K minimum (illiquid)"
-    if avg_val < 500_000_000:
-        return False, f"Avg daily value Rp {avg_val/1e9:.1f}B below Rp 500M minimum"
+        return False, f"Avg volume {avg_vol/1e6:.2f}M terlalu kecil (illiquid)"
+    if daily_turnover < 5_000_000_000:
+        return False, f"Daily turnover Rp {daily_turnover/1e9:.1f}B < Rp 5B minimum (exit liquidity risk)"
     return True, ""
 
 
 # ─────────────────────────────────────────────
-# CORE ANALYSIS
+# 0-100 SCORING ENGINE
 # ─────────────────────────────────────────────
 
-def analyse_ticker(ticker: str, company_name: str = "") -> Optional[TechnicalResult]:
-    symbol = f"{ticker}.JK" if not ticker.endswith(".JK") else ticker
+def _calc_score(
+    regime: str,
+    rsi: float, adx: float,
+    ema8: float, ema21: float, ema50: float, ema200: float, price: float,
+    vol_ratio: float, vol_signal: str,
+    rs_score: float, ad_divergence: bool,
+    bb_lower: float, bb_mid: float,
+    roe: Optional[float], der: Optional[float], pbv: Optional[float],
+    rev_g: Optional[float], is_lq45: bool,
+    rumor_flags: List[str], silent_accum: bool,
+    cmet: List[str], cfail: List[str]
+) -> Tuple[int, str, str]:
+    """
+    Score 0-100 across 5 dimensions (20 pts each):
+    1. Trend/Regime Alignment (20)
+    2. Momentum Indicators   (20)
+    3. Volume/Flow           (20)
+    4. Fundamental Quality   (20)
+    5. Catalyst/Alpha        (20)
+    """
+    score = 0
+
+    # ── 1. Trend / Regime Alignment (20 pts) ──
+    if regime in ("BULL", "SIDEWAYS"):
+        if ema8 > ema21:              score += 7;  cmet.append("EMA8 > EMA21 (uptrend) ✓")
+        else:                                       cfail.append("EMA8 < EMA21 (no uptrend)")
+        if price > ema50:             score += 7;  cmet.append(f"Price > EMA50 {_rp(ema50)} ✓")
+        else:                                       cfail.append(f"Price < EMA50 {_rp(ema50)}")
+        if price > ema200:            score += 6;  cmet.append(f"Price > EMA200 {_rp(ema200)} ✓")
+        else:                                       cfail.append(f"Price < EMA200 {_rp(ema200)}")
+    else:  # BEAR / PANIC — mean reversion scoring
+        if price < bb_lower:          score += 10; cmet.append(f"Price below Bollinger Lower {_rp(bb_lower)} (oversold) ✓")
+        elif price < bb_mid:          score += 5;  cmet.append("Price below BB midline ✓")
+        else:                                       cfail.append("Price above BB mid (not oversold enough)")
+        if rs_score > 1.2:            score += 10; cmet.append(f"RS Score {rs_score:.2f} > 1.2 (outperforming IHSG) ✓")
+        elif rs_score > 0.8:          score += 5;  cmet.append(f"RS Score {rs_score:.2f} moderate")
+        else:                                       cfail.append(f"RS Score {rs_score:.2f} underperforming IHSG")
+
+    # ── 2. Momentum Indicators (20 pts) ────────
+    if regime in ("BULL", "SIDEWAYS"):
+        if 50 <= rsi <= 70:           score += 10; cmet.append(f"RSI {rsi:.1f} in buy zone 50–70 ✓")
+        elif 45 <= rsi < 50:          score += 5;  cmet.append(f"RSI {rsi:.1f} near buy zone")
+        else:                                       cfail.append(f"RSI {rsi:.1f} outside 50–70")
+        if adx > 25:                  score += 10; cmet.append(f"ADX {adx:.1f} trending (>25) ✓")
+        else:                                       cfail.append(f"ADX {adx:.1f} weak trend")
+    else:  # mean reversion
+        if rsi < 35:                  score += 15; cmet.append(f"RSI {rsi:.1f} oversold <35 (mean revert setup) ✓")
+        elif rsi < 45:                score += 8;  cmet.append(f"RSI {rsi:.1f} approaching oversold")
+        else:                                       cfail.append(f"RSI {rsi:.1f} not oversold enough for mean reversion")
+        if is_lq45 and rsi < 35:      score += 5;  cmet.append("LQ45 Blue Chip oversold = institutional discount ✓")
+
+    # ── 3. Volume / Flow (20 pts) ──────────────
+    if vol_ratio >= 5.0:              score += 20; cmet.append(f"Volume {vol_ratio:.1f}x avg — EXPLOSIVE ✓")
+    elif vol_ratio >= 3.0:            score += 15; cmet.append(f"Volume {vol_ratio:.1f}x avg — Strong ✓")
+    elif vol_ratio >= 1.5:            score += 8;  cmet.append(f"Volume {vol_ratio:.1f}x avg — Above avg ✓")
+    else:                                           cfail.append(f"Volume {vol_ratio:.1f}x avg — Weak")
+
+    if ad_divergence:                 score += 0   # handled separately as bonus below
+    if silent_accum:                  score += 5;  cmet.append("Silent accumulation detected (high vol + narrow range) ✓")
+
+    # ── 4. Fundamental Quality (20 pts) ────────
+    fund = 0
+    if roe and roe > 0.20:            fund += 6;   cmet.append(f"ROE {roe*100:.1f}% excellent (>20%) ✓")
+    elif roe and roe > 0.15:          fund += 4;   cmet.append(f"ROE {roe*100:.1f}% good (>15%) ✓")
+    elif roe:                                       cfail.append(f"ROE {roe*100:.1f}% below 15%")
+
+    if der and der < 0.8:             fund += 5;   cmet.append(f"DER {der:.2f}x strong balance sheet ✓")
+    elif der and der < 1.5:           fund += 3;   cmet.append(f"DER {der:.2f}x acceptable ✓")
+    elif der:                                       cfail.append(f"DER {der:.2f}x highly leveraged")
+
+    if pbv and 0.8 <= pbv <= 2.5:     fund += 5;   cmet.append(f"PBV {pbv:.2f}x fair value ✓")
+    elif pbv and pbv < 0.8:           fund += 3;   cmet.append(f"PBV {pbv:.2f}x potential value ✓")
+    elif pbv:                                       cfail.append(f"PBV {pbv:.2f}x expensive")
+
+    if rev_g and rev_g > 0.15:        fund += 4;   cmet.append(f"Revenue growth {rev_g*100:.1f}% strong ✓")
+    elif rev_g and rev_g > 0.08:      fund += 2;   cmet.append(f"Revenue growth {rev_g*100:.1f}% moderate ✓")
+    elif rev_g:                                     cfail.append(f"Revenue growth {rev_g*100:.1f}% weak")
+    score += min(fund, 20)
+
+    # ── 5. Catalyst / Alpha (20 pts) ───────────
+    if rumor_flags:                   score += 15; cmet.append(f"Catalyst detected: {', '.join(rumor_flags[:2])} ✓")
+    if silent_accum and vol_ratio >= 5:score += 5; cmet.append("Explosive silent accumulation = bandar front-running ✓")
+
+    # ── A/D Divergence Bonus (up to +10) ───────
+    if ad_divergence:                 score = min(100, score + 10)
+
+    score = max(0, min(100, score))
+
+    # Label
+    if score >= 80:
+        label    = "🔥 HIGH CONVICTION — Institutional Accumulation Detected"
+        play     = "Momentum Play" if regime in ("BULL", "SIDEWAYS") else "Institutional Discount"
+    elif score >= 60:
+        label    = "⚡ MODERATE — Worth Watching"
+        play     = "VCP Setup" if adx > 20 else "Mean Reversion"
+    elif score >= 40:
+        label    = "🟡 LOW-MODERATE — Weak Setup"
+        play     = "Speculative / Rumor Play" if rumor_flags else "Watch Only"
+    else:
+        label    = "❌ LOW INTEREST — Avoid"
+        play     = "Avoid"
+
+    if rumor_flags and score >= 50:
+        play = "Rumor Play 🎯"
+    if is_lq45 and rsi < 35 and regime in ("BEAR", "PANIC"):
+        play = "Institutional Discount 🏦"
+
+    return score, label, play
+
+
+# ─────────────────────────────────────────────
+# MAIN ANALYSIS
+# ─────────────────────────────────────────────
+
+_ihsg_cache: Optional[pd.DataFrame] = None
+_ihsg_cache_time: Optional[datetime] = None
+
+def _get_ihsg_df() -> pd.DataFrame:
+    global _ihsg_cache, _ihsg_cache_time
+    now = datetime.utcnow()
+    if (_ihsg_cache is not None and _ihsg_cache_time is not None
+            and (now - _ihsg_cache_time).seconds < 3600):
+        return _ihsg_cache
+    try:
+        df = yf.Ticker("^JKSE").history(period="6mo", interval="1d")
+        _ihsg_cache      = df
+        _ihsg_cache_time = now
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+def analyse_ticker(ticker: str, company_name: str = "",
+                   regime_result: Optional[RegimeResult] = None) -> Optional[TechnicalResult]:
+    symbol      = f"{ticker}.JK" if not ticker.endswith(".JK") else ticker
     ticker_clean = ticker.replace(".JK", "")
-    result = TechnicalResult(ticker=ticker_clean, company_name=company_name or ticker_clean)
+    result      = TechnicalResult(ticker=ticker_clean,
+                                  company_name=company_name or ticker_clean)
 
     try:
+        # ── Fetch data ───────────────────────────
         tk   = yf.Ticker(symbol)
         df   = tk.history(period="1y", interval="1d")
         info = {}
@@ -225,364 +460,451 @@ def analyse_ticker(ticker: str, company_name: str = "") -> Optional[TechnicalRes
             pass
 
         if df is None or len(df) < 30:
-            result.is_rejected   = True
-            result.rejection_reason = "Insufficient price history (<30 days)"
+            result.is_rejected      = True
+            result.rejection_reason = "Data tidak cukup (<30 hari)"
             return result
 
         close  = df["Close"]
         volume = df["Volume"]
         price  = float(close.iloc[-1])
+        prev   = float(close.iloc[-2]) if len(close) > 1 else price
 
-        # ── Volume ──────────────────────────────
-        avg_vol = float(volume.rolling(20).mean().iloc[-1])
-        avg_val = avg_vol * price
-        today_vol = float(volume.iloc[-1])
-        vol_ratio = today_vol / avg_vol if avg_vol > 0 else 0
+        # ── Volume & liquidity ────────────────────
+        avg_vol      = float(volume.rolling(20).mean().iloc[-1])
+        today_vol    = float(volume.iloc[-1])
+        vol_ratio    = today_vol / avg_vol if avg_vol > 0 else 0
+        daily_turnover = today_vol * price
 
-        # ── Universe filter ──────────────────────
-        mcap = float(info.get("marketCap", 0) or 0)
-        ok, reason = _passes_universe_filter(ticker_clean, price, avg_vol, avg_val, mcap)
+        # ── Universe filter ───────────────────────
+        ok, reason = _passes_universe_filter(ticker_clean, price, avg_vol, daily_turnover)
         if not ok:
-            result.is_rejected = True
+            result.is_rejected      = True
             result.rejection_reason = reason
             return result
 
-        # ── Technicals ───────────────────────────
+        # ── ARA/ARB check ────────────────────────
+        at_arb, at_ara, arb_msg = _check_arb_ara(price, prev)
+
+        # ── Technicals ────────────────────────────
         ema8   = float(close.ewm(span=8).mean().iloc[-1])
         ema21  = float(close.ewm(span=21).mean().iloc[-1])
         ema50  = float(close.ewm(span=50).mean().iloc[-1])
         ema200 = float(close.ewm(span=200).mean().iloc[-1])
         rsi    = _calc_rsi(close)
         adx    = _calc_adx(df)
+        atr    = _calc_atr(df)
+        bb_upper, bb_mid, bb_lower = _calc_bollinger(close)
         high20 = float(close.rolling(20).max().iloc[-1])
         low20  = float(close.rolling(20).min().iloc[-1])
+        high6m = float(close.rolling(min(126, len(close))).max().iloc[-1])
         s1, s2, r1, r2 = _support_resistance(df)
+
+        # ── RS Score ─────────────────────────────
+        ihsg_df  = _get_ihsg_df()
+        rs_score = calc_rs_score(ticker_clean, df, ihsg_df) if not ihsg_df.empty else 0.0
+
+        # ── A/D Divergence ────────────────────────
+        ad_div, ad_msg = detect_ad_divergence(df, lookback=20)
 
         # ── Volume signal ─────────────────────────
         day_range = float(df["High"].iloc[-1]) - float(df["Low"].iloc[-1])
         close_pos = ((price - float(df["Low"].iloc[-1])) / day_range) if day_range > 0 else 0.5
         if vol_ratio >= 2.0:
-            vol_signal = "accumulation" if close_pos >= 0.75 else \
-                         "distribution" if close_pos <= 0.25 else "neutral_high_vol"
+            vol_signal = ("accumulation" if close_pos >= 0.75
+                          else "distribution" if close_pos <= 0.25
+                          else "neutral_high_vol")
         else:
             vol_signal = "neutral"
 
-        # ── Fundamentals ─────────────────────────
-        roe  = info.get("returnOnEquity")
-        der_raw = info.get("debtToEquity")
-        der  = der_raw / 100 if der_raw else None   # yfinance returns %, convert to ratio
-        pbv  = info.get("priceToBook")
-        pe   = info.get("trailingPE")
+        silent_accum = _detect_silent_accumulation(df, vol_ratio)
+
+        # ── Fundamentals ──────────────────────────
+        roe   = info.get("returnOnEquity")
+        der_r = info.get("debtToEquity")
+        der   = der_r / 100 if der_r else None
+        pbv   = info.get("priceToBook")
+        pe    = info.get("trailingPE")
         rev_g = info.get("revenueGrowth")
+        mcap  = float(info.get("marketCap", 0) or 0)
+        is_lq45 = ticker_clean in LQ45_TICKERS
 
-        # ── Scoring ──────────────────────────────
+        # ── Regime ────────────────────────────────
+        if regime_result is None:
+            regime_result = detect_regime()
+        regime   = regime_result.regime
+        strategy = regime_result.strategy
+
+        # ── News & rumors ─────────────────────────
+        news, rumor_flags, cong_flag = _fetch_news_and_rumors(ticker_clean)
+
+        # ── Scoring ───────────────────────────────
         cmet, cfail = [], []
-        tech_score = 0
-
-        def chk(cond, yes_msg, no_msg):
-            nonlocal tech_score
-            if cond:
-                tech_score += 1
-                cmet.append(yes_msg)
-            else:
-                cfail.append(no_msg)
-
-        chk(ema8 > ema21,              f"EMA8 {_rp(ema8)} > EMA21 {_rp(ema21)} ✓",
-                                        f"EMA8 < EMA21 (no uptrend)")
-        chk(price > ema50,             f"Price above EMA50 {_rp(ema50)} ✓",
-                                        f"Price below EMA50 {_rp(ema50)}")
-        chk(price > ema200,            f"Price above EMA200 {_rp(ema200)} ✓",
-                                        f"Price below EMA200 {_rp(ema200)}")
-        chk(50 <= rsi <= 70,           f"RSI {rsi:.1f} in buy zone (50–70) ✓",
-                                        f"RSI {rsi:.1f} outside 50–70 zone")
-        chk(adx > 25,                  f"ADX {adx:.1f} trending (>25) ✓",
-                                        f"ADX {adx:.1f} weak trend (<25)")
-        chk(vol_ratio >= 1.5,          f"Volume {vol_ratio:.1f}x avg ✓",
-                                        f"Volume {vol_ratio:.1f}x avg (need >1.5x)")
-        chk(price >= high20 * 0.97,    f"Near/at 20-day high {_rp(high20)} ✓",
-                                        f"Not near 20-day high {_rp(high20)}")
-
-        fund_score = 0
-        if roe and roe > 0.15:
-            fund_score += 1; cmet.append(f"ROE {roe*100:.1f}% > 15% ✓")
-        elif roe:
-            cfail.append(f"ROE {roe*100:.1f}% < 15%")
-
-        if der and der < 1.5:
-            fund_score += 1; cmet.append(f"DER {der:.2f}x < 1.5x ✓")
-        elif der:
-            cfail.append(f"DER {der:.2f}x > 1.5x (leveraged)")
-
-        if pbv and 0.8 <= pbv <= 3.0:
-            fund_score += 1; cmet.append(f"PBV {pbv:.2f}x in fair range ✓")
-        elif pbv:
-            cfail.append(f"PBV {pbv:.2f}x outside fair range (0.8–3x)")
-
-        if rev_g and rev_g > 0.10:
-            fund_score += 1; cmet.append(f"Revenue growth {rev_g*100:.1f}% > 10% ✓")
-        elif rev_g:
-            cfail.append(f"Revenue growth {rev_g*100:.1f}% < 10%")
-
-        # ── Trade levels ─────────────────────────
-        entry_low  = price
-        entry_high = price * 1.02
-        stop_loss  = s1 * 0.98 if s1 > 0 else price * 0.94
-        risk       = price - stop_loss
-        t1         = price + risk * 1.5
-        t2         = price + risk * 2.5
-        t3         = price + risk * 4.0
-        rr         = (t2 - price) / risk if risk > 0 else 0
-
-        # ── Entry trigger text ────────────────────
-        trigger = (
-            f"Price > {_rp(high20)} (20d high breakout) "
-            f"AND Volume > 2x avg "
-            f"AND RSI 50–70 "
-            f"AND IHSG > EMA50"
+        total_score, score_label, play_type = _calc_score(
+            regime, rsi, adx, ema8, ema21, ema50, ema200, price,
+            vol_ratio, vol_signal, rs_score, ad_div,
+            bb_lower, bb_mid,
+            roe, der, pbv, rev_g, is_lq45,
+            rumor_flags, silent_accum,
+            cmet, cfail
         )
 
-        passed = tech_score >= config.MIN_TECHNICAL_COUNT
+        passed = total_score >= 60
 
-        # ── IHSG macro ────────────────────────────
-        ihsg = _ihsg_trend()
+        # ── Trade levels ──────────────────────────
+        if regime in ("BULL", "SIDEWAYS"):
+            # Momentum entry
+            entry_low  = price
+            entry_high = price * 1.02
+            stop_loss  = max(s1 * 0.98, price - 1.5 * atr) if s1 > 0 else price - 1.5 * atr
+        else:
+            # Mean reversion entry — limit at -1 SD from 20d mean
+            entry_low  = bb_lower
+            entry_high = bb_mid * 0.99
+            stop_loss  = bb_lower - 1.5 * atr
 
-        # ── News ──────────────────────────────────
-        news = _fetch_news(ticker_clean)
+        risk  = max(price - stop_loss, price * 0.02)
+        t1    = price + risk * 1.5
+        t2    = price + risk * 2.5
+        t3    = price + risk * 4.0
+        rr    = (t2 - price) / risk if risk > 0 else 0
 
-        # ── Thesis generation ─────────────────────
-        verdict, verdict_reason, buy_thesis, bear_case, invalidation = _generate_thesis(
-            ticker_clean, price, tech_score, fund_score,
-            roe, der, pbv, rev_g, pe,
-            vol_signal, vol_ratio, rsi, adx,
-            ema8, ema21, ema50, ema200,
-            s1, r1, high20, ihsg, passed, news
+        # Lot size (100 shares per lot)
+        lot_size = max(1, int(10_000_000 / (price * 100))) if price > 0 else 1
+
+        # ── Entry trigger ─────────────────────────
+        if regime in ("BULL", "SIDEWAYS"):
+            trigger = (f"Price > {_rp(high20)} (20d high) "
+                       f"AND Vol > 2x avg "
+                       f"AND RSI 50–70 "
+                       f"AND IHSG > EMA50")
+        elif play_type == "Rumor Play 🎯":
+            trigger = (f"Price breaks {_rp(high6m)} (6-month resistance) "
+                       f"AND Vol > 5x avg "
+                       f"AND confirmed rumor keyword")
+        else:
+            trigger = (f"Price ≤ {_rp(bb_lower)} (lower Bollinger) "
+                       f"AND RSI < 35 "
+                       f"AND RS Score > 1.2 "
+                       f"AND foreign net buy 3-day trend")
+
+        # ── Verdict ───────────────────────────────
+        if at_arb:
+            verdict        = "AVOID"
+            verdict_reason = f"ARB risk — falling knife. {arb_msg}"
+        elif total_score >= 80:
+            verdict        = "BUY"
+            verdict_reason = score_label
+        elif total_score >= 60:
+            verdict        = "WATCH"
+            verdict_reason = f"{score_label} — wait for entry trigger"
+        else:
+            verdict        = "AVOID"
+            verdict_reason = score_label
+
+        # ── Thesis ────────────────────────────────
+        buy_thesis, bear_case, invalidation = _build_thesis(
+            ticker_clean, price, regime, rsi, ema50, ema200,
+            vol_signal, vol_ratio, roe, der, pbv,
+            rs_score, ad_div, ad_msg,
+            rumor_flags, cong_flag, news, is_lq45,
+            s1, r1, atr
         )
 
-        result.current_price   = price
-        result.ema8, result.ema21 = ema8, ema21
-        result.ema50, result.ema200 = ema50, ema200
-        result.rsi, result.adx = rsi, adx
-        result.today_volume    = today_vol
-        result.avg_volume_20d  = avg_vol
-        result.volume_ratio    = vol_ratio
-        result.volume_signal   = vol_signal
-        result.support_1       = s1
-        result.support_2       = s2
-        result.resistance_1    = r1
-        result.resistance_2    = r2
-        result.high_20d        = high20
-        result.low_20d         = low20
-        result.entry_low       = entry_low
-        result.entry_high      = entry_high
-        result.stop_loss       = stop_loss
-        result.t1, result.t2, result.t3 = t1, t2, t3
-        result.rr_ratio        = rr
-        result.roe, result.der = roe, der
-        result.pbv, result.pe_ratio = pbv, pe
-        result.revenue_growth  = rev_g
-        result.market_cap      = mcap
-        result.tech_score      = tech_score
-        result.fund_score      = fund_score
-        result.conditions_met  = cmet
-        result.conditions_failed = cfail
-        result.passed          = passed
-        result.ihsg_trend      = ihsg
-        result.recent_news     = news
-        result.buy_thesis      = buy_thesis
-        result.bear_case       = bear_case
-        result.invalidation    = invalidation
-        result.entry_trigger   = trigger
-        result.verdict         = verdict
-        result.verdict_reason  = verdict_reason
+        # ── Populate result ───────────────────────
+        result.current_price    = price
+        result.regime           = regime
+        result.strategy         = strategy
+        result.total_score      = total_score
+        result.score_label      = score_label
+        result.play_type        = play_type
+        result.ema8             = ema8
+        result.ema21            = ema21
+        result.ema50            = ema50
+        result.ema200           = ema200
+        result.rsi              = rsi
+        result.adx              = adx
+        result.atr              = atr
+        result.bb_upper         = bb_upper
+        result.bb_lower         = bb_lower
+        result.bb_mid           = bb_mid
+        result.rs_score         = rs_score
+        result.ad_divergence    = ad_div
+        result.ad_divergence_msg= ad_msg
+        result.today_volume     = today_vol
+        result.avg_volume_20d   = avg_vol
+        result.volume_ratio     = vol_ratio
+        result.volume_signal    = vol_signal
+        result.daily_turnover   = daily_turnover
+        result.is_silent_accum  = silent_accum
+        result.support_1        = s1
+        result.support_2        = s2
+        result.resistance_1     = r1
+        result.resistance_2     = r2
+        result.high_20d         = high20
+        result.low_20d          = low20
+        result.high_6m          = high6m
+        result.at_arb           = at_arb
+        result.at_ara           = at_ara
+        result.arb_warning      = arb_msg
+        result.entry_low        = entry_low
+        result.entry_high       = entry_high
+        result.stop_loss        = stop_loss
+        result.t1               = t1
+        result.t2               = t2
+        result.t3               = t3
+        result.rr_ratio         = rr
+        result.lot_size         = lot_size
+        result.roe              = roe
+        result.der              = der
+        result.pbv              = pbv
+        result.pe_ratio         = pe
+        result.revenue_growth   = rev_g
+        result.market_cap       = mcap
+        result.is_lq45          = is_lq45
+        result.conditions_met   = cmet
+        result.conditions_failed= cfail
+        result.passed           = passed
+        result.recent_news      = news
+        result.rumor_flags      = rumor_flags
+        result.conglomerate_flag= cong_flag
+        result.buy_thesis       = buy_thesis
+        result.bear_case        = bear_case
+        result.invalidation     = invalidation
+        result.entry_trigger    = trigger
+        result.verdict          = verdict
+        result.verdict_reason   = verdict_reason
 
         return result
 
     except Exception as e:
-        logger.error("analyse_ticker %s error: %s", ticker, e, exc_info=True)
-        result.is_rejected     = True
-        result.rejection_reason = f"Data error: {e}"
+        logger.error("analyse_ticker %s: %s", ticker, e, exc_info=True)
+        result.is_rejected      = True
+        result.rejection_reason = f"Data error: {str(e)[:100]}"
         return result
 
 
 # ─────────────────────────────────────────────
-# THESIS GENERATOR
+# THESIS BUILDER
 # ─────────────────────────────────────────────
 
-def _generate_thesis(
-    ticker, price, tech_score, fund_score,
-    roe, der, pbv, rev_g, pe,
-    vol_signal, vol_ratio, rsi, adx,
-    ema8, ema21, ema50, ema200,
-    s1, r1, high20, ihsg, passed, news
-) -> Tuple[str, str, str, str, str]:
+def _build_thesis(ticker, price, regime, rsi, ema50, ema200,
+                  vol_signal, vol_ratio, roe, der, pbv,
+                  rs_score, ad_div, ad_msg,
+                  rumor_flags, cong_flag, news, is_lq45,
+                  s1, r1, atr) -> Tuple[str, str, str]:
 
-    # Verdict
-    total = tech_score + fund_score
-    if passed and ihsg in ("bullish", "neutral") and vol_signal == "accumulation":
-        verdict = "BUY"
-        verdict_reason = f"Strong setup: {tech_score}/7 technical + {fund_score}/4 fundamental + big money accumulation"
-    elif passed and ihsg == "bearish":
-        verdict = "WATCH"
-        verdict_reason = f"Good stock but IHSG bearish — wait for index to recover EMA200 before entry"
-    elif tech_score >= 4:
-        verdict = "WATCH"
-        verdict_reason = f"{tech_score}/7 technical conditions met — not enough confluence yet"
-    else:
-        verdict = "AVOID"
-        verdict_reason = f"Only {tech_score}/7 conditions met — no edge"
-
-    # Buy thesis
-    bull_points = []
-    if ema8 > ema21:
-        bull_points.append("EMA8 crossed above EMA21 — short-term momentum positive")
-    if price > ema50:
-        bull_points.append(f"Price holding above EMA50 {_rp(ema50)} — medium trend intact")
-    if vol_signal == "accumulation":
-        bull_points.append(f"Volume {vol_ratio:.1f}x avg with close near high — bandar accumulating")
-    if roe and roe > 0.15:
-        bull_points.append(f"ROE {roe*100:.1f}% — management generating real returns above cost of capital")
-    if der and der < 1.0:
-        bull_points.append(f"Low DER {der:.2f}x — balance sheet strong, minimal currency mismatch risk")
+    bull = []
+    if ad_div:
+        bull.append(f"🚨 SMART MONEY: {ad_msg}")
+    if rs_score > 1.2:
+        bull.append(f"RS Score {rs_score:.2f} — outperforming IHSG during weakness (institutional support)")
+    if vol_signal == "accumulation" and vol_ratio >= 3:
+        bull.append(f"Volume {vol_ratio:.1f}x avg closing near high — bandar accumulating aggressively")
+    if regime in ("BEAR", "PANIC") and rsi < 35 and is_lq45:
+        bull.append("LQ45 blue chip at institutional discount — historically mean-reverting asset")
+    if roe and roe > 0.18:
+        bull.append(f"ROE {roe*100:.1f}% — high quality business compounding above cost of capital")
+    if der and der < 0.8:
+        bull.append(f"DER {der:.2f}x — strong balance sheet, minimal USD debt risk")
+    if rumor_flags:
+        bull.append(f"Catalyst rumor: {', '.join(rumor_flags)} — 'buy rumor' setup")
+    if cong_flag:
+        bull.append(cong_flag)
     if news:
-        bull_points.append(f"Recent catalyst: {news[0][:80]}")
+        bull.append(f"Recent news: {news[0][:80]}")
 
-    buy_thesis = "\n".join(f"• {p}" for p in bull_points) if bull_points else "• Insufficient bullish signals"
+    buy_thesis = "\n".join(f"• {p}" for p in bull) if bull else "• Insufficient bullish signals for thesis"
 
-    # Bear case
-    bear_points = []
-    if ihsg == "bearish":
-        bear_points.append("IHSG below EMA200 — rising tide not lifting boats, index risk is real")
-    if rsi > 70:
-        bear_points.append(f"RSI {rsi:.1f} overbought — late entry, pullback likely before next leg")
-    if der and der > 1.5:
-        bear_points.append(f"DER {der:.2f}x — heavy debt, vulnerable if BI raises rates or IDR weakens")
+    bear = []
+    if regime in ("BEAR", "PANIC"):
+        bear.append("IHSG dalam tren turun — market risk bisa overwhelm stock-specific story")
     if vol_signal == "distribution":
-        bear_points.append(f"High volume with close near low — possible bandar distributing (selling into strength)")
-    if pbv and pbv > 3:
-        bear_points.append(f"PBV {pbv:.2f}x — expensive, requires flawless execution to justify valuation")
-    bear_points.append("Liquidity risk: IDX mid-caps can gap down 5–10% on bad news with no buyers")
-    bear_points.append("Rupiah weakness vs USD can trigger foreign fund outflows across the board")
+        bear.append(f"Volume {vol_ratio:.1f}x avg tapi close near low — kemungkinan bandar distributing")
+    if der and der > 1.5:
+        bear.append(f"DER {der:.2f}x — risiko currency mismatch jika rupiah melemah vs USD")
+    if pbv and pbv > 3.5:
+        bear.append(f"PBV {pbv:.2f}x — valuasi mahal, butuh execution sempurna untuk justify")
+    if rsi > 75:
+        bear.append(f"RSI {rsi:.1f} — overbought, risiko pullback sebelum next leg up")
+    bear.append("IDX mid-cap bisa gap down 5–15% tanpa warning jika ada bad news atau market sell-off")
+    bear.append("Foreign outflow masif bisa crush saham terbaik sekalipun (lihat 2018, 2020, 2022)")
 
-    bear_case = "\n".join(f"• {p}" for p in bear_points)
+    bear_case = "\n".join(f"• {p}" for p in bear)
 
-    # Invalidation
+    stop_price = max(s1 * 0.97, price - 2 * atr) if s1 > 0 else price - 2 * atr
     invalidation = (
-        f"• Price closes below support S1 {_rp(s1)} on high volume\n"
-        f"• IHSG breaks below EMA200\n"
-        f"• RSI drops below 40 (momentum failed)\n"
-        f"• Volume dries up to <0.5x avg for 3+ days (bandar exited)\n"
-        f"• Negative corporate disclosure or KPPU/OJK action"
+        f"• Harga tutup di bawah S1 {_rp(s1)} dengan volume tinggi\n"
+        f"• IHSG break di bawah EMA200 (jika belum)\n"
+        f"• RSI turun di bawah 40 (momentum gagal)\n"
+        f"• RS Score turun di bawah 0.8 (stock underperform index)\n"
+        f"• Volume tiba-tiba sepi <0.5x avg selama 3 hari (bandar keluar)\n"
+        f"• Disclosure negatif: OJK inquiry, going concern, fraud allegation"
     )
 
-    return verdict, verdict_reason, buy_thesis, bear_case, invalidation
+    return buy_thesis, bear_case, invalidation
 
 
 # ─────────────────────────────────────────────
-# FORMATTER — Full Trade Setup Card
+# FORMATTER
 # ─────────────────────────────────────────────
 
 def format_full_analysis(t: TechnicalResult) -> str:
     rp  = _rp
-    pct = _pct
 
     verdict_emoji = {"BUY": "🟢", "WATCH": "🟡", "AVOID": "🔴"}.get(t.verdict, "⚪")
-    ihsg_emoji    = {"bullish": "📈", "neutral": "➡️", "bearish": "📉", "unknown": "❓"}.get(t.ihsg_trend, "❓")
-    vol_emoji     = {"accumulation": "🐋", "distribution": "🚨", "neutral": "➖", "neutral_high_vol": "⚠️"}.get(t.volume_signal, "➖")
+    regime_emoji  = {"BULL": "🟢", "SIDEWAYS": "🟡", "BEAR": "🟠", "PANIC": "🔴", "UNKNOWN": "⚪"}.get(t.regime, "⚪")
+    vol_emoji     = {"accumulation": "🐋 ACCUMULATION", "distribution": "🚨 DISTRIBUTION",
+                     "neutral": "➖ NEUTRAL", "neutral_high_vol": "⚠️ HIGH VOL NEUTRAL"}.get(t.volume_signal, "➖")
+
+    score_bar = "█" * (t.total_score // 10) + "░" * (10 - t.total_score // 10)
 
     lines = [
-        f"{'='*34}",
-        f"{verdict_emoji} *${t.ticker}* — {t.verdict}",
+        f"{'━'*34}",
+        f"{verdict_emoji} *${t.ticker}*  |  {t.verdict}",
         f"_{t.verdict_reason}_",
-        f"{'='*34}",
+        f"{'━'*34}",
         "",
+        f"🎯 *SCORE: {t.total_score}/100*",
+        f"`[{score_bar}]`",
+        f"_{t.score_label}_",
+        f"",
+        f"📌 *Play Type:* {t.play_type}",
+        f"{regime_emoji} *Regime:* {t.regime} — _{t.strategy}_",
         f"💰 *Price:* {rp(t.current_price)}",
-        f"🏦 *Market Cap:* Rp {t.market_cap/1e12:.2f}T" if t.market_cap else "",
-        f"{ihsg_emoji} *IHSG Macro:* {t.ihsg_trend.upper()}",
+        f"🏦 *Market Cap:* {'Rp ' + f'{t.market_cap/1e12:.2f}T' if t.market_cap > 1e12 else 'Rp ' + f'{t.market_cap/1e9:.0f}B' if t.market_cap else 'N/A'}",
+        f"{'🏅 LQ45 Blue Chip' if t.is_lq45 else ''}",
         "",
-        "📊 *TECHNICAL SETUP*",
-        f"Score: {t.tech_score}/7 conditions",
-        f"EMA8/21/50/200: {rp(t.ema8)} / {rp(t.ema21)} / {rp(t.ema50)} / {rp(t.ema200)}",
-        f"RSI: {t.rsi:.1f}  ADX: {t.adx:.1f}",
+    ]
+
+    if t.at_arb:
+        lines += [f"⛔ *{t.arb_warning}*", ""]
+    if t.at_ara:
+        lines += [f"⚠️ *{t.arb_warning}*", ""]
+    if t.ad_divergence:
+        lines += [f"🚨 *{t.ad_divergence_msg}*", ""]
+
+    lines += [
+        "📊 *TECHNICAL*",
+        f"EMA 8/21: {rp(t.ema8)} / {rp(t.ema21)}  {'✅ bullish' if t.ema8 > t.ema21 else '❌ bearish'}",
+        f"EMA 50/200: {rp(t.ema50)} / {rp(t.ema200)}",
+        f"BB: {rp(t.bb_upper)} / {rp(t.bb_mid)} / {rp(t.bb_lower)}",
+        f"RSI: {t.rsi:.1f}  ADX: {t.adx:.1f}  ATR: {rp(t.atr)}",
+        f"RS Score vs IHSG: *{t.rs_score:.2f}* {'✅ outperforming' if t.rs_score > 1.2 else '❌ underperforming'}",
         "",
         "📐 *SUPPORT & RESISTANCE*",
         f"R2: {rp(t.resistance_2)}  R1: {rp(t.resistance_1)}",
-        f"Price: ➤ {rp(t.current_price)}",
+        f"Price ➤ {rp(t.current_price)}",
         f"S1: {rp(t.support_1)}  S2: {rp(t.support_2)}",
-        f"20d High: {rp(t.high_20d)}  20d Low: {rp(t.low_20d)}",
+        f"20d High/Low: {rp(t.high_20d)} / {rp(t.low_20d)}",
+        f"6m High (resistance): {rp(t.high_6m)}",
         "",
-        f"{vol_emoji} *VOLUME / FLOW*",
-        f"Today: {t.today_volume/1e6:.1f}M  |  20d avg: {t.avg_volume_20d/1e6:.1f}M",
-        f"Ratio: {t.volume_ratio:.1f}x  →  {t.volume_signal.upper().replace('_',' ')}",
+        f"{vol_emoji}",
+        f"Volume: {t.today_volume/1e6:.1f}M  |  20d Avg: {t.avg_volume_20d/1e6:.1f}M  |  Ratio: *{t.volume_ratio:.1f}x*",
+        f"Daily Turnover: Rp {t.daily_turnover/1e9:.1f}B",
+        f"{'🎯 SILENT ACCUMULATION DETECTED' if t.is_silent_accum else ''}",
         "",
-        "📈 *FUNDAMENTALS*",
-        f"ROE: {f'{t.roe*100:.1f}%' if t.roe else 'N/A'}  "
+        "💹 *FUNDAMENTALS*",
+        f"ROE: {'%s%%' % f'{t.roe*100:.1f}' if t.roe else 'N/A'}  "
         f"DER: {f'{t.der:.2f}x' if t.der else 'N/A'}  "
         f"PBV: {f'{t.pbv:.2f}x' if t.pbv else 'N/A'}  "
         f"PE: {f'{t.pe_ratio:.1f}x' if t.pe_ratio else 'N/A'}",
         f"Rev Growth: {f'{t.revenue_growth*100:.1f}%' if t.revenue_growth else 'N/A'}",
-        f"Fund Score: {t.fund_score}/4",
         "",
         "🎯 *TRADE PLAN*",
+        f"Setup: {t.play_type}",
         f"Entry Zone: {rp(t.entry_low)} – {rp(t.entry_high)}",
         f"Stop Loss: {rp(t.stop_loss)} (–{abs((t.stop_loss-t.current_price)/t.current_price*100):.1f}%)",
         f"T1: {rp(t.t1)} (+{(t.t1/t.current_price-1)*100:.1f}%)",
         f"T2: {rp(t.t2)} (+{(t.t2/t.current_price-1)*100:.1f}%)",
         f"T3: {rp(t.t3)} (+{(t.t3/t.current_price-1)*100:.1f}%)",
         f"R:R Ratio: 1:{t.rr_ratio:.1f}",
-        f"Time Stop: Exit if <+5% in 10 trading days",
+        f"Lot Size (Rp 10M position): {t.lot_size} lots ({t.lot_size*100:,} shares)",
+        f"Time Stop: Exit jika <+5% dalam 10 hari trading",
         "",
+    ]
+
+    if t.play_type == "Rumor Play 🎯":
+        lines += [
+            "📣 *RUMOR PLAY RULES*",
+            "• Entry: Buy on breakout above 6-month resistance",
+            "• Exit 70%: Saat news masuk IDNFinancials / IDX disclosure",
+            "• Hold 30%: Trailing stop 7% dari high",
+            "• Risk: 'Sell the news' bisa brutal — size kecil",
+            "",
+        ]
+    elif "Institutional Discount" in t.play_type:
+        lines += [
+            "🏦 *INSTITUTIONAL DISCOUNT RULES*",
+            f"• Entry: Limit order di {rp(t.bb_lower)} (lower BB)",
+            f"• TP: EMA20 {rp(t.bb_mid)}",
+            f"• Stop: 1.5x ATR = {rp(t.stop_loss)}",
+            "• Foreign flow net buy 3-day = confirmation",
+            "",
+        ]
+
+    lines += [
         "⚡ *ENTRY TRIGGER*",
         f"_{t.entry_trigger}_",
         "",
-        "🐂 *BULL CASE (Why I win)*",
+        "🐂 *BULL CASE*",
         t.buy_thesis,
         "",
         "🐻 *BEAR CASE (How I lose money)*",
         t.bear_case,
         "",
-        "❌ *INVALIDATION POINTS*",
+        "❌ *INVALIDATION*",
         t.invalidation,
     ]
 
+    if t.rumor_flags:
+        lines += ["", f"🔥 *CATALYST FLAGS:* {', '.join(t.rumor_flags)}"]
+    if t.conglomerate_flag:
+        lines += [t.conglomerate_flag]
     if t.recent_news:
-        lines += ["", "📰 *RECENT NEWS / RUMORS*"]
+        lines += ["", "📰 *NEWS / RUMORS*"]
         for n in t.recent_news[:4]:
             lines.append(f"• _{n[:100]}_")
 
+    cmet_str  = "\n".join(f"  ✅ {c}" for c in t.conditions_met[:6])
+    cfail_str = "\n".join(f"  ❌ {c}" for c in t.conditions_failed[:4])
     lines += [
         "",
-        "✅ *CONDITIONS MET*",
-        *[f"  ✓ {c}" for c in t.conditions_met],
-        "",
-        "✗ *CONDITIONS FAILED*",
-        *[f"  ✗ {c}" for c in t.conditions_failed[:4]],
+        f"*CONDITIONS MET ({len(t.conditions_met)})*",
+        cmet_str,
+        f"*CONDITIONS FAILED ({len(t.conditions_failed)})*",
+        cfail_str,
     ]
 
     return "\n".join(l for l in lines if l is not None)
 
 
 # ─────────────────────────────────────────────
-# BATCH ANALYSIS (for /scan)
+# BATCH + MARKET HEALTH
 # ─────────────────────────────────────────────
 
-def analyse_tickers_batch(pairs: List[Tuple[str, str]]) -> List[TechnicalResult]:
+def analyse_tickers_batch(pairs: List[Tuple[str, str]],
+                          regime_result: Optional[RegimeResult] = None) -> List[TechnicalResult]:
+    if regime_result is None:
+        regime_result = detect_regime()
     results = []
     for ticker, name in pairs:
         try:
-            r = analyse_ticker(ticker, name)
+            r = analyse_ticker(ticker, name, regime_result)
             if r:
                 results.append(r)
         except Exception as e:
-            logger.warning("Batch analyse error %s: %s", ticker, e)
+            logger.warning("Batch error %s: %s", ticker, e)
     return results
 
 
 def is_market_healthy() -> Tuple[bool, str]:
-    trend = _ihsg_trend()
-    if trend == "bullish":
-        return True,  "IHSG bullish — above EMA50 & EMA200. Full scan active."
-    elif trend == "neutral":
-        return True,  "IHSG neutral — above EMA200 only. Selective longs only."
-    elif trend == "bearish":
-        return False, "IHSG bearish — below EMA200. No new longs. Capital preservation mode."
-    return True, "IHSG status unknown — proceeding with caution."
+    r = detect_regime()
+    # No longer binary — always return True but with regime context
+    msgs = {
+        "BULL":    (True,  f"IHSG Bull — Trend following mode. Full scan aktif."),
+        "SIDEWAYS":(True,  f"IHSG Sideways — VCP + selective momentum mode."),
+        "BEAR":    (True,  f"IHSG Bear — Switching ke Mean Reversion + RS Hunt mode."),
+        "PANIC":   (True,  f"IHSG Panic — Institutional Discount + RS Hunt. Size kecil."),
+        "UNKNOWN": (True,  f"IHSG unknown — Defensive mode, lanjut dengan hati-hati."),
+    }
+    return msgs.get(r.regime, (True, "Market status unknown"))
