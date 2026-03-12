@@ -30,6 +30,22 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+# ── Start command ───────────────────────────────────────────────────────────
+
+async def cmd_start(update, context):
+    await update.message.reply_text(
+        "👋 *Selamat datang di IDX Story Bot!*\n\n"
+        "📋 *Available Commands:*\n\n"
+        "🔍 /scan — Scan saham dengan katalis fundamental\n"
+        "📈 /ticker <kode> — Cek analisis saham tertentu\n"
+        "         _Contoh: /ticker BBCA_\n"
+        "📰 /news — Berita terbaru dari IDX\n"
+        "📊 /report — Weekly performance report\n\n"
+        "⏰ _Auto-scan berjalan otomatis setiap hari sesuai jadwal._",
+        parse_mode="Markdown"
+    )
+
+
 # ── Scheduled jobs ─────────────────────────────────────────────────────────
 
 async def _auto_scan(bot: Bot):
@@ -97,6 +113,7 @@ def main():
     init_db()
 
     app = Application.builder().token(config.TELEGRAM_TOKEN).post_init(post_init).build()
+    app.add_handler(CommandHandler("start",  cmd_start))
     app.add_handler(CommandHandler("scan",   cmd_scan))
     app.add_handler(CommandHandler("ticker", cmd_ticker))
     app.add_handler(CommandHandler("news",   cmd_news))
