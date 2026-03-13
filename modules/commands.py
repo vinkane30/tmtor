@@ -1,6 +1,6 @@
 """
 modules/commands.py — IDX Story Bot v4
-4 commands only: /scan /ticker /news /report
+4 commands: /start /scan /ticker /news /report
 """
 
 import asyncio
@@ -14,53 +14,52 @@ from telegram.constants import ParseMode
 
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+
 import config
 from modules.story        import run_story_detection
 from modules.regime       import detect_regime
 from modules.macro        import fetch_macro_context, get_macro_tag, get_sector_for_ticker
-from modules.technical    import (analyse_ticker, analyse_tickers_batch,
-                                   is_market_healthy, format_full_analysis)
+from modules.technical    import analyse_ticker, analyse_tickers_batch, is_market_healthy, format_full_analysis
 from modules.signals      import build_and_save_signals, format_scan_summary
-from modules.self_improve import (build_weekly_report, format_weekly_report_message,
-                                   evaluate_open_signals)
+from modules.self_improve import build_weekly_report, format_weekly_report_message, evaluate_open_signals
 from modules.database     import get_recent_catalysts
 
 logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────
-# SAFE FORMATTING
+# HELPERS
 # ─────────────────────────────────────────────
 
-def _rp(v: float) -> str:
+def _rp(v):
     try:
-        return f"Rp {float(v):,.0f}"
+        return "Rp " + "{:,.0f}".format(float(v))
     except Exception:
         return "Rp 0"
 
-def _safe(v) -> str:
-    """Strip markdown-breaking characters from dynamic values."""
+def _safe(v):
     s = str(v) if v is not None else "N/A"
     for ch in ["_", "*", "`", "[", "]"]:
         s = s.replace(ch, "")
     return s
 
-async def _send(update: Update, text: str):
-    """Send in chunks with Markdown fallback."""
+async def _send(update, text):
     for chunk in [text[i:i+4000] for i in range(0, len(text), 4000)]:
         try:
             await update.message.reply_text(
-                chunk, parse_mode=ParseMode.MARKDOWN,
+                chunk,
+                parse_mode=ParseMode.MARKDOWN,
                 disable_web_page_preview=True
             )
         except Exception:
             clean = re.sub(r'[*_`]', '', chunk)
             await update.message.reply_text(
-                clean, disable_web_page_preview=True
+                clean,
+                disable_web_page_preview=True
             )
         await asyncio.sleep(0.2)
 
-def _catalyst_label(ctype: str) -> str:
+def _catalyst_label(ctype):
     return {
         "asset_injection":        "Injeksi Aset",
         "strategic_acquisition":  "Akuisisi/Merger",
@@ -72,12 +71,12 @@ def _catalyst_label(ctype: str) -> str:
         "rights_issue":           "Rights Issue",
     }.get(ctype, ctype.replace("_", " ").title())
 
-def _regime_bar(regime: str) -> str:
+def _regime_bar(regime):
     return {
-        "BULL":    "🟢 BULL    — Trend Following",
+        "BULL":    "🟢 BULL     — Trend Following",
         "SIDEWAYS":"🟡 SIDEWAYS — VCP + Selective",
-        "BEAR":    "🟠 BEAR    — Mean Reversion + RS",
-        "PANIC":   "🔴 PANIC   — Institutional Discount",
+        "BEAR":    "🟠 BEAR     — Mean Reversion + RS",
+        "PANIC":   "🔴 PANIC    — Institutional Discount",
         "UNKNOWN": "⚪ UNKNOWN  — Defensive",
     }.get(regime, "⚪ UNKNOWN")
 
@@ -90,168 +89,167 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "*IDX Story Bot v4*\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "4 commands only:\n\n"
+        "4 commands:\n\n"
         "*/scan*\n"
-        "Regime detection + catalyst scan +\n"
-        "5 day trade + 5 swing setups.\n"
-        "Everything in one.\n\n"
+        "Regime detection, catalyst scan,\n"
+        "5 day trade + 5 swing setups.\n\n"
         "*/ticker BBRI*\n"
         "4-Point Alpha Report: regime, verdict,\n"
         "catalyst, full trade setup.\n\n"
         "*/news*\n"
         "Macro context (Brent, USD/IDR, sectors)\n"
-        "+ corporate actions last 24h.\n\n"
+        "and corporate actions last 24h.\n\n"
         "*/report*\n"
         "Weekly win rate and signal performance.\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "Score: 80+ High Conviction | 60+ Watch\n"
-        "40+ Speculative | below 40 Avoid\n\n"
+        "Score: 80+ High Conviction\n"
+        "60+ Watch | 40+ Speculative | below 40 Avoid\n\n"
         "Bukan rekomendasi investasi. DYOR.",
         parse_mode=ParseMode.MARKDOWN
     )
 
 
 # ─────────────────────────────────────────────
-# /scan — regime + catalyst scan + 10 screens
+# /scan — regime + catalyst + 10 screens
 # ─────────────────────────────────────────────
 
 async def cmd_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text(
-        "Initialising full scan...\n"
-        "Step 1/4: Detecting regime..."
+        "Initialising full scan...\nStep 1/4: Detecting regime..."
     )
 
-    # ── Step 1: Regime + Macro ────────────────
+    # Step 1: Regime + Macro
     regime = detect_regime()
     macro  = fetch_macro_context()
 
     regime_section = (
-        f"*MARKET REGIME*\n"
-        f"{_regime_bar(regime.regime)}\n"
-        f"IHSG {_rp(regime.ihsg_price)}  "
-        f"RSI {regime.ihsg_rsi:.1f}  "
-        f"Vol {regime.ihsg_atr_pct:.2f}%\n"
-        f"EMA50: {_rp(regime.ihsg_ema50)}  "
-        f"EMA200: {_rp(regime.ihsg_ema200)}\n"
+        "*MARKET REGIME*\n"
+        + _regime_bar(regime.regime) + "\n"
+        + "IHSG " + _rp(regime.ihsg_price)
+        + "  RSI " + str(round(regime.ihsg_rsi, 1))
+        + "  Vol " + str(round(regime.ihsg_atr_pct, 2)) + "%\n"
+        + "EMA50: " + _rp(regime.ihsg_ema50)
+        + "  EMA200: " + _rp(regime.ihsg_ema200) + "\n"
     )
 
+    brent_sign = "+" if macro.brent_change_pct >= 0 else ""
     macro_section = (
-        f"\n*MACRO*\n"
-        f"Brent ${macro.brent_price:.0f} "
-        f"({'+' if macro.brent_change_pct >= 0 else ''}"
-        f"{macro.brent_change_pct:.1f}%)  "
-        f"Gold ${macro.gold_price:.0f}  "
-        f"USD/IDR {macro.usd_idr:,.0f}\n"
+        "\n*MACRO*\n"
+        + "Brent $" + str(round(macro.brent_price))
+        + " (" + brent_sign + str(round(macro.brent_change_pct, 1)) + "%)"
+        + "  Gold $" + str(round(macro.gold_price))
+        + "  USD/IDR " + "{:,.0f}".format(macro.usd_idr) + "\n"
     )
 
     if macro.hot_sectors:
-        macro_section += f"Hot: {', '.join(macro.hot_sectors)}\n"
+        macro_section += "Hot: " + ", ".join(macro.hot_sectors) + "\n"
     if macro.weak_sectors:
-        macro_section += f"Weak: {', '.join(macro.weak_sectors)}\n"
+        macro_section += "Weak: " + ", ".join(macro.weak_sectors) + "\n"
     if macro.narrative:
-        macro_section += f"_{_safe(macro.narrative[:200])}_\n"
+        macro_section += "_" + _safe(macro.narrative[:200]) + "_\n"
 
     await msg.edit_text(
         regime_section + macro_section + "\nStep 2/4: Scanning catalysts...",
         parse_mode=ParseMode.MARKDOWN
     )
 
-    # ── Step 2: Catalyst scan ─────────────────
+    # Step 2: Catalyst scan
     stories = await run_story_detection()
-
     catalyst_section = ""
     signal_triples   = []
 
     if stories:
-        technicals     = analyse_tickers_batch(
+        technicals = analyse_tickers_batch(
             [(s.ticker, s.company_name) for s in stories],
             regime_result=regime
         )
         signal_triples = build_and_save_signals(stories, technicals)
-
         if signal_triples:
             catalyst_section = (
-                f"\n*CATALYST SIGNALS ({len(signal_triples)} found)*\n"
+                "\n*CATALYST SIGNALS (" + str(len(signal_triples)) + " found)*\n"
                 + format_scan_summary([(s, t) for s, t, _ in signal_triples])
             )
         else:
             catalyst_section = (
-                f"\n*CATALYSTS*\n"
-                f"{len(stories)} found but none passed {regime.strategy} filter.\n"
+                "\n*CATALYSTS*\n"
+                + str(len(stories)) + " found but none passed "
+                + regime.strategy + " filter.\n"
             )
     else:
-        catalyst_section = "\n*CATALYSTS*\nNo new corporate actions detected.\n"
+        if regime.regime in ("BEAR", "PANIC"):
+            catalyst_section = (
+                "\n*CATALYSTS*\n"
+                "No new catalysts.\n"
+                "Regime: Mean Reversion + RS Hunt mode.\n"
+                "Check LQ45: /ticker BBCA /ticker BBRI /ticker TLKM\n"
+            )
+        else:
+            catalyst_section = "\n*CATALYSTS*\nNo new corporate actions detected.\n"
 
     await msg.edit_text(
-        regime_section + macro_section + catalyst_section +
-        "\nStep 3/4: Running screens...",
+        regime_section + macro_section + catalyst_section + "\nStep 3/4: Running screens...",
         parse_mode=ParseMode.MARKDOWN
     )
 
-    # ── Step 3: 10 screens ────────────────────
+    # Step 3: Screens
+    day_trades, swings = [], []
     try:
         from modules.screens import run_all_screens
         day_trades, swings = run_all_screens()
     except Exception as e:
         logger.error("Screens error: %s", e)
-        day_trades, swings = [], []
 
-    # ── Step 4: Assemble full output ──────────
+    # Step 4: Send all
     try:
         await msg.delete()
     except Exception:
         pass
 
-    # Part 1 — Regime + Macro + Catalysts
-    part1 = regime_section + macro_section + catalyst_section
-    await _send(update, part1)
+    await _send(update, regime_section + macro_section + catalyst_section)
 
-    # Individual catalyst cards
     for _, _, signal_msg in signal_triples:
         await asyncio.sleep(0.4)
         await _send(update, signal_msg)
 
-    # Part 2 — Day Trade screens
     if day_trades:
         dt_lines = [
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-            f"*5 DAY TRADE SETUPS*",
-            f"_{datetime.now().strftime('%d %b %Y')}_\n",
+            "*5 DAY TRADE SETUPS*",
+            "_" + datetime.now().strftime("%d %b %Y") + "_\n",
         ]
         for i, r in enumerate(day_trades, 1):
             risk_pct = abs((r.entry_price - r.stop_loss) / r.entry_price * 100) if r.entry_price > 0 else 0
             dt_lines += [
-                f"*{i}. {r.ticker} — {_safe(r.screen_name)}*",
-                f"Price: {_rp(r.price)}  RSI: {r.rsi:.0f}  Vol: {r.vol_ratio:.1f}x",
-                f"Timeframe: {_safe(r.timeframe)}",
-                f"Trigger: {_safe(r.entry_trigger[:120])}",
-                f"Entry: {_rp(r.entry_price)}  Stop: {_rp(r.stop_loss)} (-{risk_pct:.1f}%)",
-                f"T1: {_rp(r.target_1)}  T2: {_rp(r.target_2)}  R:R 1:{r.rr_ratio:.1f}",
-                f"Why: {_safe(r.why[:180])}",
-                f"Risk: {_safe(r.risk_note[:100])}",
+                "*" + str(i) + ". " + r.ticker + " — " + _safe(r.screen_name) + "*",
+                "Price: " + _rp(r.price) + "  RSI: " + str(round(r.rsi)) + "  Vol: " + str(round(r.vol_ratio, 1)) + "x",
+                "Timeframe: " + _safe(r.timeframe),
+                "Trigger: " + _safe(r.entry_trigger[:120]),
+                "Entry: " + _rp(r.entry_price) + "  Stop: " + _rp(r.stop_loss) + " (-" + str(round(risk_pct, 1)) + "%)",
+                "T1: " + _rp(r.target_1) + "  T2: " + _rp(r.target_2) + "  R:R 1:" + str(round(r.rr_ratio, 1)),
+                "Why: " + _safe(r.why[:180]),
+                "Risk: " + _safe(r.risk_note[:100]),
                 "",
             ]
         await _send(update, "\n".join(dt_lines))
 
-    # Part 3 — Swing screens
     if swings:
         sw_lines = [
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-            f"*5 SWING SETUPS*",
-            f"_{datetime.now().strftime('%d %b %Y')}_\n",
+            "*5 SWING SETUPS*",
+            "_" + datetime.now().strftime("%d %b %Y") + "_\n",
         ]
         for i, r in enumerate(swings, 1):
             risk_pct = abs((r.entry_price - r.stop_loss) / r.entry_price * 100) if r.entry_price > 0 else 0
-            rs_str   = f"  RS: {r.rs_score:.2f}" if r.rs_score else ""
+            rs_str   = "  RS: " + str(round(r.rs_score, 2)) if r.rs_score else ""
             sw_lines += [
-                f"*{i}. {r.ticker} — {_safe(r.screen_name)}*",
-                f"Price: {_rp(r.price)}  RSI: {r.rsi:.0f}  Vol: {r.vol_ratio:.1f}x{rs_str}",
-                f"Timeframe: {_safe(r.timeframe)}",
-                f"Trigger: {_safe(r.entry_trigger[:120])}",
-                f"Entry: {_rp(r.entry_price)}  Stop: {_rp(r.stop_loss)} (-{risk_pct:.1f}%)",
-                f"T1: {_rp(r.target_1)}  T2: {_rp(r.target_2)}  R:R 1:{r.rr_ratio:.1f}",
-                f"Why: {_safe(r.why[:220])}",
-                f"Risk: {_safe(r.risk_note[:100])}",
+                "*" + str(i) + ". " + r.ticker + " — " + _safe(r.screen_name) + "*",
+                "Price: " + _rp(r.price) + "  RSI: " + str(round(r.rsi)) + "  Vol: " + str(round(r.vol_ratio, 1)) + "x" + rs_str,
+                "Timeframe: " + _safe(r.timeframe),
+                "Trigger: " + _safe(r.entry_trigger[:120]),
+                "Entry: " + _rp(r.entry_price) + "  Stop: " + _rp(r.stop_loss) + " (-" + str(round(risk_pct, 1)) + "%)",
+                "T1: " + _rp(r.target_1) + "  T2: " + _rp(r.target_2) + "  R:R 1:" + str(round(r.rr_ratio, 1)),
+                "Why: " + _safe(r.why[:220]),
+                "Risk: " + _safe(r.risk_note[:100]),
                 "",
             ]
         sw_lines.append("/ticker KODE for full institutional analysis")
@@ -276,7 +274,7 @@ async def cmd_ticker(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ticker = ctx.args[0].upper().strip().replace(".JK", "")
 
     msg = await update.message.reply_text(
-        f"Analysing {ticker}...\n"
+        "Analysing " + ticker + "...\n"
         "Regime, RS score, A/D divergence, macro, news..."
     )
 
@@ -285,17 +283,17 @@ async def cmd_ticker(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         macro  = fetch_macro_context()
         tech   = analyse_ticker(ticker, regime_result=regime)
     except Exception as e:
-        await msg.edit_text(f"Error: {str(e)[:150]}")
+        await msg.edit_text("Error: " + str(e)[:150])
         return
 
     if tech is None:
-        await msg.edit_text(f"No data for {ticker}. Check ticker code.")
+        await msg.edit_text("No data for " + ticker + ". Check ticker code.")
         return
 
     if tech.is_rejected:
         await msg.edit_text(
-            f"Filtered out: {ticker}\n"
-            f"Reason: {_safe(tech.rejection_reason)}"
+            "Filtered out: " + ticker + "\n"
+            "Reason: " + _safe(tech.rejection_reason)
         )
         return
 
@@ -304,96 +302,83 @@ async def cmd_ticker(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
-    sector     = get_sector_for_ticker(ticker) or "General"
+    sector    = get_sector_for_ticker(ticker) or "General"
     macro_tag, macro_explain = get_macro_tag(ticker, macro, tech.rsi)
-    verdict_emoji = {"BUY":"🟢","WATCH":"🟡","AVOID":"🔴"}.get(tech.verdict, "⚪")
+    verdict_emoji = {"BUY": "🟢", "WATCH": "🟡", "AVOID": "🔴"}.get(tech.verdict, "⚪")
 
-    # ── Score bar ─────────────────────────────
     filled    = tech.total_score // 10
     score_bar = "█" * filled + "░" * (10 - filled)
 
-    # ── Analyst narrative ─────────────────────
     pct_from_200 = ((tech.ema200 - tech.current_price) / tech.current_price * 100
                     if tech.ema200 > 0 else 0)
     analyst_text = _build_analyst_verdict(
         ticker, tech, macro, sector, macro_tag, macro_explain, pct_from_200
     )
 
-    # ── Trade levels ──────────────────────────
     risk_pct = abs((tech.stop_loss - tech.current_price) / tech.current_price * 100)
     t1_pct   = (tech.t1 / tech.current_price - 1) * 100 if tech.current_price > 0 else 0
     t2_pct   = (tech.t2 / tech.current_price - 1) * 100 if tech.current_price > 0 else 0
 
+    rs_label = "outperforming" if tech.rs_score > 1.2 else "underperforming"
+
     report = [
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        f"*{ticker}* | Score *{tech.total_score}/100*",
-        f"[{score_bar}]",
-        f"{verdict_emoji} *{tech.verdict}* — {_safe(tech.play_type)}",
+        "*" + ticker + "* | Score *" + str(tech.total_score) + "/100*",
+        "[" + score_bar + "]",
+        verdict_emoji + " *" + tech.verdict + "* — " + _safe(tech.play_type),
         "",
-
-        # ── Point 1 ──────────────────────────
         "*1. REGIME HEALTH*",
-        f"{_regime_bar(tech.regime)}",
-        f"Sector ({sector}): {_safe(macro.sector_advice.get(sector, 'Neutral'))}",
-        f"IHSG {_rp(regime.ihsg_price)}  RSI {regime.ihsg_rsi:.1f}",
+        _regime_bar(tech.regime),
+        "Sector (" + sector + "): " + _safe(macro.sector_advice.get(sector, "Neutral")),
+        "IHSG " + _rp(regime.ihsg_price) + "  RSI " + str(round(regime.ihsg_rsi, 1)),
         "",
-
-        # ── Point 2 ──────────────────────────
         "*2. ANALYST VERDICT*",
         _safe(analyst_text),
         "",
-
-        # ── Point 3 ──────────────────────────
         "*3. CATALYST CHECK*",
     ]
 
     if tech.rumor_flags:
-        report.append(f"Catalyst: {', '.join(tech.rumor_flags)}")
+        report.append("Catalyst: " + ", ".join(tech.rumor_flags))
     if tech.conglomerate_flag:
         report.append(_safe(tech.conglomerate_flag))
     if macro_tag:
-        report.append(f"Macro: {macro_tag}")
+        report.append("Macro: " + macro_tag)
         report.append(_safe(macro_explain[:120]))
     if not tech.rumor_flags and not macro_tag:
         report.append("No active catalyst. Monitor IDX disclosure feed.")
     if tech.recent_news:
-        report.append(f"News: {_safe(tech.recent_news[0][:100])}")
+        report.append("News: " + _safe(tech.recent_news[0][:100]))
 
     report += [
         "",
-
-        # ── Point 4 ──────────────────────────
         "*4. TRADE SETUP*",
-        f"Play: {_safe(tech.play_type)}",
-        f"Entry: {_rp(tech.entry_low)} to {_rp(tech.entry_high)}",
-        f"Trigger: {_safe(tech.entry_trigger[:120])}",
-        f"Stop: {_rp(tech.stop_loss)} (-{risk_pct:.1f}%)",
-        f"T1: {_rp(tech.t1)} (+{t1_pct:.1f}%)",
-        f"T2: {_rp(tech.t2)} (+{t2_pct:.1f}%)",
-        f"R:R 1:{tech.rr_ratio:.1f}  Lots: {tech.lot_size}",
+        "Play: " + _safe(tech.play_type),
+        "Entry: " + _rp(tech.entry_low) + " to " + _rp(tech.entry_high),
+        "Trigger: " + _safe(tech.entry_trigger[:120]),
+        "Stop: " + _rp(tech.stop_loss) + " (-" + str(round(risk_pct, 1)) + "%)",
+        "T1: " + _rp(tech.t1) + " (+" + str(round(t1_pct, 1)) + "%)",
+        "T2: " + _rp(tech.t2) + " (+" + str(round(t2_pct, 1)) + "%)",
+        "R:R 1:" + str(round(tech.rr_ratio, 1)) + "  Lots: " + str(tech.lot_size),
         "",
-
         "*Technicals*",
-        f"Price {_rp(tech.current_price)}  RSI {tech.rsi:.1f}  ADX {tech.adx:.1f}",
-        f"EMA8/21: {_rp(tech.ema8)} / {_rp(tech.ema21)}",
-        f"EMA50/200: {_rp(tech.ema50)} / {_rp(tech.ema200)}",
-        f"BB: {_rp(tech.bb_upper)} / {_rp(tech.bb_mid)} / {_rp(tech.bb_lower)}",
-        "RS vs IHSG: " + str(round(tech.rs_score, 2)) + (" (outperforming)" if tech.rs_score > 1.2 else " (underperforming)"),
-        f"Volume: {tech.today_volume/1e6:.1f}M ({tech.volume_ratio:.1f}x) {_safe(tech.volume_signal)}",
-        f"S1/S2: {_rp(tech.support_1)} / {_rp(tech.support_2)}",
-        f"R1/R2: {_rp(tech.resistance_1)} / {_rp(tech.resistance_2)}",
+        "Price " + _rp(tech.current_price) + "  RSI " + str(round(tech.rsi, 1)) + "  ADX " + str(round(tech.adx, 1)),
+        "EMA8/21: " + _rp(tech.ema8) + " / " + _rp(tech.ema21),
+        "EMA50/200: " + _rp(tech.ema50) + " / " + _rp(tech.ema200),
+        "BB: " + _rp(tech.bb_upper) + " / " + _rp(tech.bb_mid) + " / " + _rp(tech.bb_lower),
+        "RS vs IHSG: " + str(round(tech.rs_score, 2)) + " (" + rs_label + ")",
+        "Volume: " + str(round(tech.today_volume / 1e6, 1)) + "M (" + str(round(tech.volume_ratio, 1)) + "x) " + _safe(tech.volume_signal),
+        "S1/S2: " + _rp(tech.support_1) + " / " + _rp(tech.support_2),
+        "R1/R2: " + _rp(tech.resistance_1) + " / " + _rp(tech.resistance_2),
         "",
-
         "*Fundamentals*",
-        f"ROE: {f'{tech.roe*100:.1f}%' if tech.roe else 'N/A'}  "
-        f"DER: {f'{tech.der:.2f}x' if tech.der else 'N/A'}  "
-        f"PBV: {f'{tech.pbv:.2f}x' if tech.pbv else 'N/A'}",
+        "ROE: " + (str(round(tech.roe * 100, 1)) + "%" if tech.roe else "N/A")
+        + "  DER: " + (str(round(tech.der, 2)) + "x" if tech.der else "N/A")
+        + "  PBV: " + (str(round(tech.pbv, 2)) + "x" if tech.pbv else "N/A"),
         "",
-
         "*Bear Case*",
         _safe(tech.bear_case[:250]),
         "",
-
         "*Invalidation*",
         _safe(tech.invalidation[:200]),
     ]
@@ -406,7 +391,7 @@ async def cmd_ticker(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ]
 
     if tech.at_arb:
-        report += ["", f"ARB WARNING: {_safe(tech.arb_warning)}"]
+        report += ["", "ARB WARNING: " + _safe(tech.arb_warning)]
 
     await _send(update, "\n".join(str(l) for l in report))
 
@@ -420,12 +405,12 @@ def _build_analyst_verdict(ticker, tech, macro, sector,
     if regime in ("BEAR", "PANIC") and rsi < 35 and sector == "Banking":
         pct_str = str(round(abs(pct_from_200), 1))
         return (ticker + " is a value-trap for retail but a buy-zone for big funds. "
-                "Price " + pct_str + "% below EMA200 — "
-                "historically 5-8% bounce in 10 trading days. "
+                "Price " + pct_str + "% below EMA200. "
+                "Historically 5-8% bounce in 10 trading days. "
                 "Foreign flow stabilization is the confirmation signal.")
 
     if macro_tag == "Geopolitical Hedge":
-        brent_str = str(round(macro.brent_price, 0))
+        brent_str = str(round(macro.brent_price))
         rs_str    = str(round(rs, 2))
         return (ticker + " decouples from IHSG in this environment. "
                 "Brent $" + brent_str + "/bbl = sector tailwind. "
@@ -451,8 +436,110 @@ def _build_analyst_verdict(ticker, tech, macro, sector,
                 "RS " + rs_str + " vs IHSG. ADX " + adx_str + " trend confirmed. "
                 "Entry on trigger only, do not chase.")
 
-    rsi_str   = str(round(rsi, 0))
+    rsi_str   = str(round(rsi))
     label_str = _safe(tech.score_label)
     return (ticker + ": " + label_str + ". "
             "RSI " + rsi_str + ". "
             "Wait for entry trigger before committing capital.")
+
+
+# ─────────────────────────────────────────────
+# /news — macro + corporate actions merged
+# ─────────────────────────────────────────────
+
+async def cmd_news(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    msg = await update.message.reply_text(
+        "Loading macro context and corporate actions..."
+    )
+
+    regime = detect_regime()
+    macro  = fetch_macro_context()
+    rows   = get_recent_catalysts(hours=24)
+
+    brent_sign = "+" if macro.brent_change_pct >= 0 else ""
+
+    lines = [
+        "*MACRO CONTEXT*",
+        _regime_bar(regime.regime),
+        "",
+        "Brent:   $" + str(round(macro.brent_price))
+        + " (" + brent_sign + str(round(macro.brent_change_pct, 1)) + "%)",
+        "Gold:    $" + str(round(macro.gold_price)),
+        "USD/IDR: " + "{:,.0f}".format(macro.usd_idr),
+        "",
+    ]
+
+    if macro.narrative:
+        lines += [
+            "*Theme Today*",
+            _safe(macro.narrative[:300]),
+            "",
+        ]
+
+    if macro.sector_advice:
+        lines.append("*Sector Rotation*")
+        for sector, advice in list(macro.sector_advice.items())[:6]:
+            ret   = macro.sector_returns.get(sector, 0)
+            arrow = "▲" if ret > 0 else ("▼" if ret < 0 else "─")
+            lines.append(arrow + " " + sector + ": " + _safe(advice[:60]))
+        lines.append("")
+
+    if macro.macro_headlines:
+        lines.append("*Global Headlines*")
+        for h in macro.macro_headlines[:4]:
+            lines.append("• " + _safe(h[:100]))
+        lines.append("")
+
+    lines += [
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        "*CORPORATE ACTIONS — 24H*",
+        "_" + str(len(rows)) + " events detected_\n",
+    ]
+
+    if not rows:
+        lines.append("No corporate actions in last 24 hours.")
+        lines.append("Try /scan to trigger detection.")
+    else:
+        rows.sort(key=lambda r: r.get("score", 0), reverse=True)
+        for r in rows[:10]:
+            score    = r.get("score", 0)
+            dot      = "🔴" if score >= 9 else ("🟡" if score >= 7 else "🟢")
+            ctype    = _catalyst_label(r.get("catalyst_type", ""))
+            t        = r.get("ticker", "?")
+            headline = _safe(r.get("headline", "")[:80])
+            url      = r.get("source_url", "")
+            lines += [
+                dot + " *" + t + "* " + ctype + " " + str(score) + "/10",
+                "   " + headline,
+                "   " + url,
+                "",
+            ]
+
+    lines.append("/ticker KODE for full analysis")
+
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+
+    await _send(update, "\n".join(lines))
+
+
+# ─────────────────────────────────────────────
+# /report
+# ─────────────────────────────────────────────
+
+async def cmd_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    msg = await update.message.reply_text("Generating weekly report...")
+    try:
+        evaluate_open_signals()
+        report = build_weekly_report()
+        text   = format_weekly_report_message(report)
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+        await _send(update, text)
+    except Exception as e:
+        await msg.edit_text("Report error: " + str(e)[:200])
+        logger.error("cmd_report: %s", e, exc_info=True)
