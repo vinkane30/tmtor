@@ -412,37 +412,47 @@ async def cmd_ticker(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 def _build_analyst_verdict(ticker, tech, macro, sector,
-                            macro_tag, macro_explain, pct_from_200) -> str:
+                            macro_tag, macro_explain, pct_from_200):
     rsi    = tech.rsi
     rs     = tech.rs_score
     regime = tech.regime
 
     if regime in ("BEAR", "PANIC") and rsi < 35 and sector == "Banking":
-        return (
-            f"{ticker} is a value-trap for retail but a buy-zone for big funds. "
-            f"Price {abs(pct_from_200):.1f}% below EMA200 — "
-            f"historically 5-8% bounce in 10 trading days. "
-            f"Foreign flow stabilization is the confirmation signal."
-        )
+        pct_str = str(round(abs(pct_from_200), 1))
+        return (ticker + " is a value-trap for retail but a buy-zone for big funds. "
+                "Price " + pct_str + "% below EMA200 — "
+                "historically 5-8% bounce in 10 trading days. "
+                "Foreign flow stabilization is the confirmation signal.")
+
     if macro_tag == "Geopolitical Hedge":
-        return (
-            f"{ticker} decouples from IHSG in this environment. "
-            f"Brent ${macro.brent_price:.0f}/bbl = sector tailwind. "
-            f"This plays its own macro — RS {rs:.2f} confirms institutional support."
-        )
+        brent_str = str(round(macro.brent_price, 0))
+        rs_str    = str(round(rs, 2))
+        return (ticker + " decouples from IHSG in this environment. "
+                "Brent $" + brent_str + "/bbl = sector tailwind. "
+                "This plays its own macro. RS " + rs_str + " confirms institutional support.")
+
     if tech.ad_divergence:
-        return (
-            f"Smart money accumulating {ticker} while retail sells. "
-            f"A/D Line rising while price falls = institutional footprint. "
-            f"Highest-conviction signal available. Score: {tech.total_score}/100."
-        )
+        score_str = str(tech.total_score)
+        return ("Smart money accumulating " + ticker + " while retail sells. "
+                "A/D Line rising while price falls = institutional footprint. "
+                "Highest-conviction signal available. Score: " + score_str + "/100.")
+
     if tech.is_silent_accum:
-        return (
-            f"Pre-catalyst positioning in {ticker}. "
-            f"Volume {tech.volume_ratio:.1f}x avg, tight range = bandar front-running. "
-            f"Expect disclosure or news within 1-5 days."
-        )
+        vr_str = str(round(tech.volume_ratio, 1))
+        return ("Pre-catalyst positioning in " + ticker + ". "
+                "Volume " + vr_str + "x avg, tight range = bandar front-running. "
+                "Expect disclosure or news within 1-5 days.")
+
     if tech.verdict == "BUY":
-        return (
-            f"{ticker} passes regime filters. Score {tech.total_score}/100. "
-            f"RS {rs:.2f} vs IHSG. ADX {tech.adx:.1
+        score_str = str(tech.total_score)
+        rs_str    = str(round(rs, 2))
+        adx_str   = str(round(tech.adx, 1))
+        return (ticker + " passes regime filters. Score " + score_str + "/100. "
+                "RS " + rs_str + " vs IHSG. ADX " + adx_str + " trend confirmed. "
+                "Entry on trigger only, do not chase.")
+
+    rsi_str   = str(round(rsi, 0))
+    label_str = _safe(tech.score_label)
+    return (ticker + ": " + label_str + ". "
+            "RSI " + rsi_str + ". "
+            "Wait for entry trigger before committing capital.")
