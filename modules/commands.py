@@ -449,73 +449,241 @@ def _build_analyst_verdict(ticker, tech, macro, sector,
 
 async def cmd_news(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text(
-        "Loading macro context and corporate actions..."
+        "Preparing institutional pre-market briefing...\n"
+        "Fetching global, macro, foreign flow, sector data..."
     )
 
+    # ── Data fetch ──────────────────────────────────────────
     regime = detect_regime()
     macro  = fetch_macro_context()
     rows   = get_recent_catalysts(hours=24)
 
+    # Global prices via yfinance
+    import yfinance as yf
+
+    def _pct(ticker, period="2d"):
+        try:
+            df = yf.Ticker(ticker).history(period=period, interval="1d")
+            if len(df) >= 2:
+                p  = float(df["Close"].iloc[-1])
+                p0 = float(df["Close"].iloc[-2])
+                return p, round((p / p0 - 1) * 100, 2)
+            return None, None
+        except Exception:
+            return None, None
+
+    sp500_p,  sp500_c  = _pct("^GSPC")
+    nasdaq_p, nasdaq_c = _pct("^IXIC")
+    eido_p,   eido_c   = _pct("EIDO")
+    bond_p,   _        = _pct("INDOGB10.JK")  # fallback — may return None
+    coal_p,   coal_c   = _pct("MTF=F")        # Newcastle coal futures
+    nickel_p, nickel_c = _pct("NI=F")
+
+    def _arrow(c):
+        if c is None: return "─"
+        return "▲" if c > 0 else ("▼" if c < 0 else "─")
+
+    def _fmt(p, c, prefix=""):
+        if p is None: return "N/A"
+        sign = "+" if c >= 0 else ""
+        return prefix + "{:,.2f}".format(p) + " (" + sign + str(c) + "%)"
+
+    # Bond yield flag
+    bond_flag = ""
+    if bond_p and bond_p > 7.0:
+        bond_flag = "🚨 ABOVE 7% — BANKING LIQUIDITY RISK"
+    elif bond_p and bond_p > 6.8:
+        bond_flag = "⚠️ Approaching danger zone"
+
+    # Regime label
+    regime_label = {
+        "BULL":    "🟢 RISK-ON  — IHSG above EMA200. Full position sizing.",
+        "SIDEWAYS":"🟡 NEUTRAL  — IHSG between EMA50/200. Selective only.",
+        "BEAR":    "🟠 RISK-OFF — IHSG below EMA200. 30-40% sizing only.",
+        "PANIC":   "🔴 PANIC    — IHSG well below EMA200. Cash + hedges only.",
+        "UNKNOWN": "⚪ UNKNOWN  — Defensive until confirmed.",
+    }.get(regime.regime, "⚪ UNKNOWN")
+
+    # EIDO sentiment
+    eido_sentiment = ""
+    if eido_c is not None:
+        if eido_c < -1.5:
+            eido_sentiment = "Foreigners pricing in more IDX downside."
+        elif eido_c > 1.0:
+            eido_sentiment = "Foreign institutional appetite returning."
+        else:
+            eido_sentiment = "Neutral foreign signal — watch open."
+
+    # Commodity interpretation
+    def _commodity_note(name, chg):
+        if chg is None: return ""
+        if name == "Brent" and chg > 2:
+            return " — ADRO ITMG PTBA tailwind"
+        if name == "Coal" and chg > 1:
+            return " — Coal names accelerating"
+        if name == "Nickel" and chg > 1.5:
+            return " — INCO MDKA watch"
+        return ""
+
+    brent_note  = _commodity_note("Brent", macro.brent_change_pct)
+    coal_note   = _commodity_note("Coal", coal_c)
+    nickel_note = _commodity_note("Nickel", nickel_c)
+
     brent_sign = "+" if macro.brent_change_pct >= 0 else ""
 
-    lines = [
-        "*MACRO CONTEXT*",
-        _regime_bar(regime.regime),
-        "",
-        "Brent:   $" + str(round(macro.brent_price))
-        + " (" + brent_sign + str(round(macro.brent_change_pct, 1)) + "%)",
-        "Gold:    $" + str(round(macro.gold_price)),
-        "USD/IDR: " + "{:,.0f}".format(macro.usd_idr),
-        "",
-    ]
+    # Alpha sector
+    alpha_sector = ""
+    if macro.hot_sectors:
+        alpha_sector = ", ".join(macro.hot_sectors)
+    elif macro.sector_returns:
+        best = max(macro.sector_returns, key=macro.sector_returns.get)
+        alpha_sector = best + " " + str(macro.sector_returns[best]) + "%"
 
-    if macro.narrative:
-        lines += [
-            "*Theme Today*",
-            _safe(macro.narrative[:300]),
-            "",
-        ]
-
-    if macro.sector_advice:
-        lines.append("*Sector Rotation*")
-        for sector, advice in list(macro.sector_advice.items())[:6]:
-            ret   = macro.sector_returns.get(sector, 0)
-            arrow = "▲" if ret > 0 else ("▼" if ret < 0 else "─")
-            lines.append(arrow + " " + sector + ": " + _safe(advice[:60]))
-        lines.append("")
-
-    if macro.macro_headlines:
-        lines.append("*Global Headlines*")
-        for h in macro.macro_headlines[:4]:
-            lines.append("• " + _safe(h[:100]))
-        lines.append("")
-
-    lines += [
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        "*CORPORATE ACTIONS — 24H*",
-        "_" + str(len(rows)) + " events detected_\n",
-    ]
-
-    if not rows:
-        lines.append("No corporate actions in last 24 hours.")
-        lines.append("Try /scan to trigger detection.")
-    else:
+    # Corporate actions
+    ca_lines = []
+    if rows:
         rows.sort(key=lambda r: r.get("score", 0), reverse=True)
-        for r in rows[:10]:
-            score    = r.get("score", 0)
-            dot      = "🔴" if score >= 9 else ("🟡" if score >= 7 else "🟢")
-            ctype    = _catalyst_label(r.get("catalyst_type", ""))
-            t        = r.get("ticker", "?")
+        for r in rows[:6]:
+            score   = r.get("score", 0)
+            dot     = "🔴" if score >= 9 else ("🟡" if score >= 7 else "🟢")
+            ctype   = _catalyst_label(r.get("catalyst_type", ""))
+            t       = r.get("ticker", "?")
             headline = _safe(r.get("headline", "")[:80])
-            url      = r.get("source_url", "")
-            lines += [
-                dot + " *" + t + "* " + ctype + " " + str(score) + "/10",
+            url     = r.get("source_url", "")
+            ca_lines += [
+                dot + " *" + t + "* — " + ctype,
                 "   " + headline,
                 "   " + url,
                 "",
             ]
+    else:
+        ca_lines = [
+            "No corporate actions detected in last 24h.",
+            "Run /scan to trigger full detection.",
+        ]
 
-    lines.append("/ticker KODE for full analysis")
+    # ── Build report ────────────────────────────────────────
+    lines = [
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        "*PRE-MARKET BRIEFING*",
+        "_" + datetime.now().strftime("%A, %d %B %Y | %H:%M WIB") + "_",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        "",
+
+        # ── LAYER 1: MACRO TEMPERATURE ──────────────────────
+        "*LAYER 1 — MACRO TEMPERATURE*",
+        "",
+        "*Global Hook (Overnight)*",
+        _arrow(sp500_c)  + " S&P500:  " + _fmt(sp500_p, sp500_c),
+        _arrow(nasdaq_c) + " Nasdaq:  " + _fmt(nasdaq_p, nasdaq_c),
+        _arrow(eido_c)   + " EIDO:    " + _fmt(eido_p, eido_c, "$"),
+        "_" + _safe(eido_sentiment) + "_",
+        "",
+        "*Currency & Yields*",
+        "USD/IDR:  " + "{:,.0f}".format(macro.usd_idr)
+            + (" ⚠️ Rupiah pressure — USD earners benefit" if macro.usd_idr > 16000 else ""),
+        "10Y SBN:  " + ("{:.2f}%".format(bond_p) if bond_p else "N/A")
+            + (" " + bond_flag if bond_flag else ""),
+        "Gold:     $" + str(round(macro.gold_price)),
+        "",
+        "*Commodity Check — The Heavyweights*",
+        _arrow(macro.brent_change_pct) + " Brent:  $" + str(round(macro.brent_price))
+            + " (" + brent_sign + str(round(macro.brent_change_pct, 1)) + "%)" + brent_note,
+        _arrow(coal_c)   + " Coal:   " + _fmt(coal_p, coal_c, "$") + coal_note,
+        _arrow(nickel_c) + " Nickel: " + _fmt(nickel_p, nickel_c, "$") + nickel_note,
+        "",
+
+        # ── LAYER 2: IDX PULSE ──────────────────────────────
+        "*LAYER 2 — IDX PULSE*",
+        "",
+        "*Regime Status*",
+        regime_label,
+        "IHSG: " + _rp(regime.ihsg_price)
+            + "  EMA50: " + _rp(regime.ihsg_ema50)
+            + "  EMA200: " + _rp(regime.ihsg_ema200),
+        "",
+        "*Foreign Flow — Big 4 Banks*",
+        "BBCA / BBRI / BMRI / BBNI",
+        "_Check net foreign buy/sell on IDX or RTI before open._",
+        "_If foreigners net selling Big 4 > Rp500B = do not buy banks today._",
+        "",
+        "*Macro Narrative*",
+        "_" + _safe(macro.narrative[:350]) + "_",
+        "",
+
+        # ── LAYER 3: SECTOR & SPECIAL SITUATIONS ────────────
+        "*LAYER 3 — SECTOR & SPECIAL SITUATIONS*",
+        "",
+        "*Alpha Sector (Relative Strength)*",
+        "RS Leader: " + (_safe(alpha_sector) if alpha_sector else "No clear leader — defensive mode"),
+        "",
+        "*Sector Rotation*",
+    ]
+
+    for sector, advice in list(macro.sector_advice.items())[:8]:
+        ret   = macro.sector_returns.get(sector, 0)
+        arrow = "▲" if ret > 0 else ("▼" if ret < 0 else "─")
+        lines.append(arrow + " " + sector + ": " + _safe(advice[:55]))
+
+    lines += [
+        "",
+        "*Corporate Actions — Last 24H*",
+        "_" + str(len(rows)) + " events_",
+        "",
+    ]
+    lines += ca_lines
+
+    lines += [
+        # ── LAYER 4: PM TRADE DECISIONS ─────────────────────
+        "*LAYER 4 — TODAY'S TRADE DECISIONS*",
+        "",
+    ]
+
+    # Defensive hedge
+    if macro.geo_risk and macro.brent_price > 80:
+        lines += [
+            "*Defensive Hedge — Geopolitical*",
+            "ADRO / ITMG / PTBA — Energy names decouple from IHSG.",
+            "Brent $" + str(round(macro.brent_price)) + " = structural tailwind.",
+            "Buy dips to EMA50. Hard exit on ceasefire news.",
+            "",
+        ]
+    elif macro.usd_idr > 16000:
+        lines += [
+            "*Defensive Hedge — Rupiah Weakness*",
+            "USD/IDR " + "{:,.0f}".format(macro.usd_idr) + " — USD earner commodities are your hedge.",
+            "ADRO, ITMG, INCO benefit from weak rupiah.",
+            "",
+        ]
+    else:
+        lines += [
+            "*Defensive Hedge*",
+            "No dominant single hedge today. Raise cash in BEAR regime.",
+            "",
+        ]
+
+    # Momentum play
+    if macro.hot_sectors:
+        lines += [
+            "*Momentum Play*",
+            "Sector RS leader: " + _safe(", ".join(macro.hot_sectors[:2])),
+            "Screen for 20-day breakout on volume 2x+ in these sectors.",
+            "Use /scan for specific tickers.",
+            "",
+        ]
+
+    # Mean reversion
+    lines += [
+        "*Mean Reversion — Blue Chip Watch*",
+        "BBRI / BBCA / BMRI at multi-year lows.",
+        "Entry only when: RSI below 30 AND foreign flow stabilizes (net buy day).",
+        "Do NOT catch a falling knife. Wait for the confirmation candle.",
+        "",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        "/ticker KODE — Full institutional analysis",
+        "/scan — Live catalyst + 10 trade setups",
+        "_Bukan rekomendasi investasi. DYOR._",
+    ]
 
     try:
         await msg.delete()
