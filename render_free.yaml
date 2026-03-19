@@ -1,0 +1,21 @@
+services:
+  - type: web                     # web service — Render gives it a public HTTPS URL
+    name: idx-story-bot
+    runtime: python
+    region: singapore
+    plan: free                    # free plan — spins down on inactivity, wakes on request
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:web --host 0.0.0.0 --port $PORT
+
+    envVars:
+      - key: TELEGRAM_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: TZ
+        value: Asia/Jakarta
+      # DATABASE_PATH not set — defaults to idx_bot.db in working dir
+      # Note: free plan has no persistent disk, db resets on redeploy
+      # This is fine for on-demand use — signals history is a nice-to-have
